@@ -9,7 +9,7 @@ SystemVerilog LSP server in C++ (formatting, lint, go-to-def, references, AutoWi
 - `tests/` mirrors features (`tests/test_formatter.cpp` ↔ `src/features/formatter.cpp`) — see `tests/AGENTS.md`
 - `docs/` VitePress site (https://lazyverilog.github.io); formatter options in `docs/formatter/options.md`
 - `tools/` benches/utilities, `lua/` Neovim plugin, `scripts/` repo maintenance, `vscode/` extension
-- Deps: slang (submodule), nlohmann/json
+- Deps (CMake FetchContent): slang, LspCpp (transport, LSP types, vendored RapidJSON), toml++, Catch2
 
 ## Build / Test
 ```bash
@@ -32,7 +32,7 @@ ctest --test-dir build                     # all
 ## Project Roots (multi-project)
 - Server owns root resolution: `ProjectRootResolver` (`src/project_root.cpp`) walks up to nearest `lazyverilog.toml` (misses cached). No config and no implicit root ⇒ `nullopt`; implicit roots come only from client workspace folders / VCS root (`set_implicit_roots()`, consulted after the toml walk misses, innermost wins), never write into the tree (`IndexCache::open_implicit()` → user cache), never compile by default. Neovim plugin sends no `root_dir`/`root_markers`.
 - Per-file inputs: defines/incdirs via `ProjectParseInputs` (`src/parse_inputs.cpp`); every parse path asks per file. No flat `defines_`. One `Analyzer` for all projects.
-- Handlers with a URI use `config_for(uri)`, never `config_` (session eager-index config only). `root_` is just a prefetch hint; never repoint it.
+- Handlers use `config_for(uri)`; there is no session-wide config member. `root_` is just a prefetch hint; never repoint it.
 - Index filelist = union of all projects. `[compilation]` = one slang `Compilation` per project filelist (`CompilationSnapshot::groups`, `compile_group()`), compiled sequentially; `CompilationGroup::files` are indices into `CompilationSnapshot::files`. Gate on `config_for(uri)` (publish + `:LintAll`). Debounce is `kCompilationDebounce`; non-debounced callers use `compile_now()`.
 - No registered project ⇒ one empty-root fallback group (per-project `SourceLibrary`, all `isDefault`, sorted root order). Fallback chosen only by "did any project register what it compiles". Buffers under no toml join no group.
 - Folding projects: `fold_project_root()` accumulates (`Reindex::Deferred`), `apply_project_inputs()` schedules once. `reload_all_projects()` rebuilds all projects in deterministic sorted order on any config save.
@@ -58,8 +58,8 @@ ctest --test-dir build                     # all
 
 ## Formatter
 - Entry: `src/features/formatter.cpp` → `format_source()`. Token-based, idempotent.
-- Passes: lexer → Syntax → Macro → Wrap → Indent → Align → Comment → Spacing → BlankLine → render. Each pass writes only its own metadata (`SyntaxPass`: Syntax/Topology/CommentFacts; `XPass`: `XMetadata`; lexer: Lexeme/InputTriviaFacts).
-- Use `TokenKind`, not regex/string compares. Don't read `input_trivia` in passes (exception: comment own-line vs trailing classification).
+- Passes: lexer → Syntax → Macro → Wrap → Comment → Spacing → Indent → Align → BlankLine → render (`run_format_passes()`; Indent/Align read `spaces_before`). Each pass writes only its own metadata (`SyntaxPass`: Syntax/Topology/CommentFacts; `XPass`: `XMetadata`; lexer: Lexeme/InputTriviaFacts).
+- Use `TokenKind`, not regex/string compares. Don't read `input_trivia` in passes (exceptions: comment own-line vs trailing classification; `is_blank_line_boundary()`, which keeps the user's blank lines).
 - Intended, don't "fix": `begin_newline` also moves `struct`/`union` `{` (not `enum`); `line_length` includes indent — WrapPass estimates via `TopologyFacts::scope_depth`, never reads `IndentMetadata`.
 
 ## Hand-Built JSON

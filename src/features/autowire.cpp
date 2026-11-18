@@ -1,5 +1,6 @@
 #include "autowire.hpp"
 #include "../analyzer.hpp"
+#include "../lsp_position.hpp"
 #include "../string_utils.hpp"
 #include <algorithm>
 #include <optional>
@@ -35,13 +36,6 @@ struct LineRange {
 
 static bool in_range(int line, LineRange range) {
     return line >= range.start && line <= range.end;
-}
-
-static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid())
-        return 0;
-    auto line = sm.getFileLineNumber(tok.location());
-    return line > 0 ? (int)line - 1 : 0;
 }
 
 struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {

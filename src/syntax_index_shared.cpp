@@ -214,14 +214,6 @@ std::string uri_from_source_location(const slang::SourceManager& sm,
     return uri_from_file_name(file_name);
 }
 
-SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::SourceManager& sm,
-                                         slang::SourceLocation location) {
-    auto uri = uri_from_source_location(sm, location);
-    if (uri.empty())
-        return kInvalidSourceFileID;
-    return index.intern_source_file(std::move(uri));
-}
-
 
 SourceFileID SourceFileIdResolver::for_token(SyntaxIndex& index, const slang::SourceManager& sm,
                                              const slang::parsing::Token& token) {
@@ -355,6 +347,31 @@ std::unordered_set<std::string_view> collect_mentioned_names(
 
 std::string token_value_text(const slang::parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
+}
+
+std::string port_direction(const slang::syntax::PortHeaderSyntax& header) {
+    using namespace slang::syntax;
+    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
+        return token_value_text(variable->direction).empty() ? "unknown" : token_value_text(variable->direction);
+    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
+        return token_value_text(net->direction).empty() ? "unknown" : token_value_text(net->direction);
+    return "unknown";
+}
+
+std::string interface_port_type_text(const slang::syntax::InterfacePortHeaderSyntax& header) {
+    std::string text = token_value_text(header.nameOrKeyword);
+    if (header.modport && header.modport->member)
+        text += "." + token_value_text(header.modport->member);
+    return text;
+}
+
+int syntax_end_line0(const slang::SourceManager& sm, const slang::syntax::SyntaxNode& node,
+                     int fallback_line) {
+    const auto end = node.sourceRange().end();
+    if (!end.valid())
+        return fallback_line;
+    const auto line = sm.getFileLineNumber(end);
+    return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
 }
 
 slang::SourceLocation token_true_origin_location(const slang::SourceManager& sm,
@@ -914,6 +931,32 @@ uint64_t source_token_key(const slang::parsing::Token& token) {
            static_cast<uint64_t>(token.location().offset());
 }
 
+/// Step @p i back over a `[...]` select that ends at it, and the blanks before
+/// the select.  No-op when no `]` ends there; false when the brackets do not
+/// balance.
+bool skip_select_backward(std::string_view source, size_t& i) {
+    if (i == 0 || source[i - 1] != ']')
+        return true;
+    size_t depth = 0;
+    size_t j = i;
+    while (j > 0) {
+        const char c = source[j - 1];
+        if (c == ']')
+            ++depth;
+        else if (c == '[' && --depth == 0) {
+            --j;
+            break;
+        }
+        --j;
+    }
+    if (depth != 0)
+        return false;
+    i = j;
+    while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+        --i;
+    return true;
+}
+
 } // namespace
 
 
@@ -927,7 +970,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     if (!restrict_to_uri.empty())
         file_ids.restrict_to_uri(std::string(restrict_to_uri));
 
-    // === Lookup tables (from collect_reference_occurrences) ===
+    // === Lookup tables ===
     std::unordered_set<std::string> module_values;
     std::unordered_map<std::string, std::string> module_value_types;
     std::unordered_set<std::string> package_values;
@@ -2413,27 +2456,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             // Every copy of a generate loop shares one declaration and every
             // element of an interface array one interface, so the index inside
             // the brackets names no separate object: skip it and read the name.
-            if (i > 0 && source[i - 1] == ']') {
-                size_t depth = 0;
-                size_t j = i;
-                while (j > 0) {
-                    const char c = source[j - 1];
-                    if (c == ']')
-                        ++depth;
-                    else if (c == '[') {
-                        if (--depth == 0) {
-                            --j;
-                            break;
-                        }
-                    }
-                    --j;
-                }
-                if (depth != 0)
-                    return {};
-                i = j;
-                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
-                    --i;
-            }
+            if (!skip_select_backward(source, i))
+                return {};
             const size_t end = i;
             while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
                 --i;
@@ -2470,27 +2494,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     --i;
                 // A select names no separate object: every element of an array
                 // shares one declaration.  Same rule as object_before_member_dot().
-                if (i > 0 && source[i - 1] == ']') {
-                    size_t depth = 0;
-                    size_t j = i;
-                    while (j > 0) {
-                        const char c = source[j - 1];
-                        if (c == ']')
-                            ++depth;
-                        else if (c == '[') {
-                            if (--depth == 0) {
-                                --j;
-                                break;
-                            }
-                        }
-                        --j;
-                    }
-                    if (depth != 0)
-                        return {};
-                    i = j;
-                    while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
-                        --i;
-                }
+                if (!skip_select_backward(source, i))
+                    return {};
                 const size_t end = i;
                 while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
                     --i;
@@ -2563,25 +2568,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             --i;
             while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
                 --i;
-            if (i > 0 && source[i - 1] == ']') {
-                size_t depth = 0;
-                size_t j = i;
-                while (j > 0) {
-                    const char c = source[j - 1];
-                    if (c == ']')
-                        ++depth;
-                    else if (c == '[' && --depth == 0) {
-                        --j;
-                        break;
-                    }
-                    --j;
-                }
-                if (depth != 0)
-                    return {};
-                i = j;
-                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
-                    --i;
-            }
+            if (!skip_select_backward(source, i))
+                return {};
             if (i < receiver.size() ||
                 source.substr(i - receiver.size(), receiver.size()) != receiver)
                 return {};

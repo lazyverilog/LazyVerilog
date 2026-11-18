@@ -298,10 +298,8 @@ private:
             frozen.immutable.input_trivia.original_column =
                 tokens_[open].immutable.input_trivia.original_column +
                 static_cast<int>(tokens_[open].lex.text.size());
-            frozen.immutable.input_trivia.original_indent = frozen.immutable.input_trivia.original_column;
             // The gap before `)` is inside the frozen text now.
             auto& close_trivia = tokens_[close].immutable.input_trivia;
-            close_trivia.original_spaces_before = 0;
             close_trivia.original_newlines_before = 0;
             close_trivia.starts_original_line = false;
             tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(open + 1),
@@ -389,9 +387,7 @@ private:
     size_t passthrough_end_{0}; // end of a frozen multiline define block
     int line_{0};
     int col_{0};
-    int pending_spaces_{0};
     int pending_newlines_{0};
-    int pending_indent_{0};
 
     void consume_text(std::string_view text, bool trivia) {
         for (char c : text) {
@@ -399,18 +395,11 @@ private:
             if (c == '\n') {
                 ++line_;
                 col_ = 0;
-                if (trivia) {
+                if (trivia)
                     ++pending_newlines_;
-                    pending_spaces_ = 0;
-                    pending_indent_ = 0;
-                }
             }
             else {
                 ++col_;
-                if (trivia && (c == ' ' || c == '\t')) {
-                    ++pending_spaces_;
-                    ++pending_indent_;
-                }
             }
         }
     }
@@ -437,13 +426,6 @@ private:
         auto& lex = tok.lex;
         lex.kind = kind;
         lex.text.assign(text);
-        // lower_text is needed by folding_range (directive classification) and
-        // is intentionally not precomputed for every token when diagnostic
-        // logging is enabled.  The logger can derive it on demand; keeping this
-        // lexer path directive-only avoids a per-token string allocation in
-        // repeated large-file formatting runs.
-        if (is_directive)
-            lex.lower_text = lower_ascii(text);
         lex.directive_kind = is_directive ? directive_kind : slang::syntax::SyntaxKind::Unknown;
         lex.range = slang::SourceRange(slang::SourceLocation(slang::BufferID::getPlaceholder(), pos),
                                         slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
@@ -459,16 +441,12 @@ private:
         lex.is_format_off_marker = is_format_off_marker;
         lex.is_format_on_marker = is_format_on_marker;
         lex.is_disabled_region_body = is_disabled_region_body;
-        tok.immutable.input_trivia.original_spaces_before = pending_newlines_ > 0 ? pending_indent_ : pending_spaces_;
         tok.immutable.input_trivia.original_newlines_before = pending_newlines_;
-        tok.immutable.input_trivia.original_indent = pending_newlines_ > 0 ? pending_indent_ : col_;
         tok.immutable.input_trivia.starts_original_line = pending_newlines_ > 0 || tokens_.empty();
         tok.immutable.input_trivia.original_column = col_;
         tokens_.push_back(std::move(tok));
 
-        pending_spaces_ = 0;
         pending_newlines_ = 0;
-        pending_indent_ = 0;
     }
 
     void collect_trivia(const slang::parsing::Trivia& trivia, size_t pos) {

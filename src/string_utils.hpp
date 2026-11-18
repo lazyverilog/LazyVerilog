@@ -33,6 +33,11 @@ inline std::string trim_copy(std::string text) {
     return std::string(first, last);
 }
 
+/// A character of a SystemVerilog simple identifier (`$` included).
+inline bool is_identifier_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+}
+
 /// Append @p text to @p out as a quoted JSON string literal.
 ///
 /// The two hand-built JSON responses this server sends -- the custom

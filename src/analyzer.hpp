@@ -485,7 +485,7 @@ class Analyzer {
     /// Update text for uri, creating a new immutable DocumentState snapshot.
     void change(const std::string& uri, const std::string& text);
 
-    /// Replaces update_text() + change().  Immediately stores null-tree state
+    /// Immediately stores null-tree state
     /// with current text, assigns a monotonically increasing version, enqueues
     /// async parse.  Returns assigned version.
     /// Takes @p text by value: didChange builds the new buffer text itself and
@@ -582,11 +582,6 @@ class Analyzer {
                                           bool include_declaration = true,
                                           bool this_file_only = false,
                                           std::string* rename_refusal = nullptr) const;
-
-    /// Return all (0-based line, 0-based col) positions where `name` appears
-    /// as a whole identifier in the document.
-    std::vector<std::pair<int, int>> find_occurrences(const std::string& uri,
-                                                      const std::string& name) const;
 
     /// Call f(uri, state) for every open document snapshot.
     ///
@@ -697,10 +692,6 @@ class Analyzer {
     /// A value <= 0 publishes as soon as the background indexer can process the request.
     void set_project_index_publish_debounce_ms(int debounce_ms);
 
-    /// Set preprocessor defines (from config.design.define).
-    /// Applied on every subsequent make_state call.
-    void set_defines(const std::vector<std::string>& defines);
-
     /// Set include directories parsed from +incdir+ entries in the design filelist.
     ///
     /// They are given to slang's SourceManager so `include "..." directives
@@ -733,9 +724,8 @@ class Analyzer {
 
     /// Return project-file index shards.
     ///
-    /// Historical note: this used to return cached closed-file DocumentState
-    /// objects as well.  It now keeps DocumentState only for open buffers, so
-    /// callers must treat `state` as optional and use `index` for closed files.
+    /// DocumentState is kept only for open buffers, so callers must treat
+    /// `state` as optional and use `index` for closed files.
     std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_ptr() const;
 
     /// Return per-file project index shards without exposing full SyntaxTrees.
@@ -847,6 +837,10 @@ class Analyzer {
     std::optional<RtlTreeNode> rtl_tree_reverse(const std::string& uri) const;
 
   private:
+    /// Defined and used in analyzer.cpp only; @p View is its RtlIndexView.
+    template <class View>
+    std::optional<std::string> rtl_view_for(const std::string& uri, View& view) const;
+
     std::shared_ptr<DocumentState> make_state(const std::string& uri,
                                               const std::string& text) const;
     /// The same ordering against an explicit snapshot and path.
@@ -888,13 +882,13 @@ class Analyzer {
         std::shared_ptr<const SyntaxIndex> index;
     };
 
-    /// Append @p path to the background queue unless it is already waiting.
-    /// @p front puts it ahead of the cold-start filelist backlog, which is what
-    /// edit-driven refreshes want.
     /// Queue every open buffer and project shard that `include`s @p uri for a
     /// background reparse.  Returns whether anything was queued; the caller
     /// bumps the generation and wakes the pool.
     bool queue_include_dependents_locked(const std::string& uri) const;
+    /// Append @p path to the background queue unless it is already waiting.
+    /// @p front puts it ahead of the cold-start filelist backlog, which is what
+    /// edit-driven refreshes want.
     void queue_background_file_locked(std::string path, bool front) const;
     /// enqueue_parse(), skipped (returning 0) unless @p expected is null or
     /// still the buffer's current snapshot.
@@ -1168,15 +1162,10 @@ class Analyzer {
     // keep them.  That is one full directory sweep per keystroke on a shared
     // header; see preload_cached_shards().
     mutable uint64_t background_full_reindex_generation_{std::numeric_limits<uint64_t>::max()};
-    /// Cache for this project, and the config digest every shard is keyed on.
-    /// Empty when no project root is known or the directory cannot be written,
-    /// which is a normal read-only-checkout condition and simply runs uncached.
     /// Where each file's shards go.  Shared with the server, which resolves the
     /// same roots to answer config lookups, and held by shared_ptr because a
     /// queued shard write outlives the config reload that replaced it.
     mutable std::shared_ptr<IndexCacheStorage> index_cache_storage_;
-    // The shard config digest moved into ParseInputs: it is per project, like
-    // the defines and include directories it is computed from.
     /// Memoized content digests for the current generation, shared by the
     /// preload and the store path.
     ///
@@ -1246,6 +1235,9 @@ class Analyzer {
     };
     void queue_shard_write(PendingShardWrite write) const;
     void index_cache_writer_loop() const;
+    /// Run one dequeued write and report idle; the caller set
+    /// `index_cache_writing_`.  Shared by the writer thread and the inline drain.
+    void perform_shard_write(PendingShardWrite write) const;
     /// Perform every queued shard write on the calling thread.
     ///
     /// Only used when there is no writer thread, which is the one-CPU case:

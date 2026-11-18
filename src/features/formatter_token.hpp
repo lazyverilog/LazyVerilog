@@ -44,7 +44,6 @@ struct LexemeFacts {
     slang::parsing::TokenKind kind{slang::parsing::TokenKind::Unknown};
 
     std::string text;
-    std::string lower_text;
     slang::syntax::SyntaxKind directive_kind{slang::syntax::SyntaxKind::Unknown};
 
     slang::SourceRange range;
@@ -114,17 +113,12 @@ struct LexemeFacts {
 // where the formatter later chooses to put spaces or newlines.
 struct SyntaxFacts {
     size_t matching_token{npos};
-    size_t stmt_begin{npos};
     size_t stmt_end{npos};
-    size_t parent_construct{npos};
 
     int paren_depth{0};
     int bracket_depth{0};
     int brace_depth{0};
 
-    bool in_function_decl{false};
-    bool in_task_decl{false};
-    bool in_class_decl{false};
     bool in_covergroup{false};
     bool in_modport{false};
     // Between a clocking declaration's header and its `endclocking`.  Its
@@ -163,11 +157,6 @@ struct TopologyFacts {
 
     bool starts_parameter_list{false};
     bool starts_port_list{false};
-
-    // True for tokens strictly between a starts_argument_list OpenParen and its
-    // matching CloseParenthesis (exclusive on both ends).  Precomputed by
-    // SyntaxPass to replace O(n) backward scans.
-    bool inside_argument_list{false};
 
     // Set on every `(`, each by one forward walk in SyntaxPass, so a long
     // statement does not cost a backward scan per `(` (O(n^2) in its calls).
@@ -262,9 +251,7 @@ struct TopologyFacts {
 // about the input, useful as heuristics.  Correctness should not depend on them
 // as rendered columns or indentation policy.
 struct InputTriviaFacts {
-    int original_spaces_before{0};
     int original_newlines_before{0};
-    int original_indent{0};
     bool starts_original_line{false};
     int original_column{0};
 };
@@ -275,20 +262,12 @@ struct InputTriviaFacts {
 // when a later pass moves surrounding code.
 enum class CommentRole {
     None,
-    Leading,
     Trailing,
     OwnLine,
-    InterstitialLeading,
-    InterstitialTrailing,
-    Detached,
-    PreprocessorAdjacent,
 };
 
 struct CommentFacts {
     CommentRole role{CommentRole::None};
-    size_t anchor_token{npos};
-    bool inside_expression{false};
-    bool inside_arg_list{false};
     // Nothing followed the comment on its source line.  With `role` this is
     // the whole of what comment placement may know about the original layout:
     // `a, /* x */` at the end of a line describes `a`, while `a, /* x */ b`
@@ -322,12 +301,9 @@ enum class WrapListKind {
 };
 
 struct WrapMetadata {
-    bool can_break_before{false};
     bool must_break_before{false};
-    bool can_break_after{false};
     bool must_break_after{false};
     bool continuation{false};
-    int wrap_group{-1};
 
     // Written only by WrapPass; read by Indent/Align/Spacing to assign the
     // concrete layout for already-classified multiline delimiter groups.
@@ -341,14 +317,14 @@ struct IndentMetadata { int base_indent{0}; int continuation_indent{0}; size_t a
 // indent measured from a column (a hanging list's `(`, a block call's name)
 // was measured before alignment padded the line that column is on; the shift
 // moves it by the padding that lands before its IndentMetadata::anchor_token.
-struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; int indent_shift{0}; };
-struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
-struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
+struct AlignMetadata { bool enabled{false}; int target_column{-1}; int indent_shift{0}; };
+struct SpaceMetadata { int spaces_before{1}; };
+struct CommentMetadata { bool force_own_line{false}; };
 struct BlankLineMetadata { int before{0}; };
 // ends_statement: this token ends a semicolonless macro statement or item.
 // Every consumer that asks "where does this statement end" treats it like the
 // statement's `;` (see TopologyFacts::may_end_macro_statement).
-struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; bool ends_statement{false}; };
+struct MacroMetadata { bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; bool ends_statement{false}; };
 
 struct MutableData {
     WrapMetadata wrap;
@@ -383,12 +359,5 @@ struct Tok {
 };
 
 using TokenStream = std::vector<Tok>;
-
-class IFormatPass {
-public:
-    virtual ~IFormatPass() = default;
-    virtual const char* name() const = 0;
-    virtual void run(TokenStream& tokens) = 0;
-};
 
 } // namespace svfmt

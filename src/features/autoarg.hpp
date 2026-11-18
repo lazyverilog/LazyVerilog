@@ -14,8 +14,7 @@ struct AutoargResult {
     int end_col{0};
 };
 
-std::optional<AutoargResult> autoarg_impl(
-    const DocumentState& state, int line, int col);
+std::optional<AutoargResult> autoarg_impl(const DocumentState& state, int line);
 
 std::vector<AutoargResult> autoarg_all_modules(const DocumentState& state);
 

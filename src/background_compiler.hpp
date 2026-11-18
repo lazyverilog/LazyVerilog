@@ -37,15 +37,14 @@ inline constexpr uint32_t kDefaultCompilationErrorLimit = 64;
 /// server runs is allowed to start.
 inline constexpr std::chrono::milliseconds kCompilationDebounce{1500};
 
-/// Worker count and thread priority are not user-configurable.  Every worker
-/// compiles the whole design rather than sharing one compile, so a second
-/// worker only lets a newer snapshot start before an older one finishes -- at
-/// the cost of a duplicated full-design compilation whose result the generation
-/// check usually discards.  CPU count is not the binding resource here, peak
-/// memory is, so the useful value is 1 on every machine size.
+/// Worker count and thread priority are not user-configurable: there is one
+/// worker.  It compiles the whole design rather than sharing one compile, so a
+/// second worker would only let a newer snapshot start before an older one
+/// finishes -- at the cost of a duplicated full-design compilation whose result
+/// the generation check usually discards.  CPU count is not the binding
+/// resource here, peak memory is.
 struct BackgroundCompilerConfig {
     bool enabled{false};
-    int thread_count{1};
     /// Forwarded to slang's `CompilationOptions::errorLimit`.  0 means
     /// unlimited (slang's own encoding for "no limit").
     uint32_t error_limit{kDefaultCompilationErrorLimit};
@@ -81,11 +80,8 @@ class BackgroundCompiler {
     void stop();
 
   private:
-    struct WorkerSlot;
-
-    void worker_loop(std::shared_ptr<WorkerSlot> slot);
+    void worker_loop();
     void schedule_in(std::chrono::milliseconds delay);
-    std::vector<std::thread> collect_exited_workers_locked();
     BackgroundCompileResult compile(uint64_t generation, CompilationSnapshot snapshot) const;
     void compile_group(const CompilationSnapshot& snapshot, const CompilationGroup& group,
                        BackgroundCompileResult& result) const;
@@ -99,13 +95,9 @@ class BackgroundCompiler {
     bool enabled_{false};
     // Read by compile() on worker threads without holding mutex_.
     std::atomic<uint32_t> error_limit_{kDefaultCompilationErrorLimit};
-    size_t next_worker_id_{0};
     uint64_t latest_generation_{0};
     bool pending_{false};
     std::chrono::steady_clock::time_point due_time_{};
-    // Each worker owns a stable slot so configure() can request retirement
-    // without relying on vector indices.  This matters when the user lowers
-    // the configured thread count: excess workers should finish their current
-    // compilation, then retire before taking another job.
-    std::vector<std::shared_ptr<WorkerSlot>> workers_;
+    // Started by the first configure() that enables compilation; joined by stop().
+    std::thread worker_;
 };

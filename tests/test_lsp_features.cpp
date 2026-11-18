@@ -59,7 +59,7 @@ endmodule
     CHECK(std::find(result->port_names.begin(), result->port_names.end(), "i_clk") !=
           result->port_names.end());
 
-    const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+    const auto formatted = format_autoinst(*result, top);
     CHECK(formatted.find(".WIDTH") == std::string::npos);
     CHECK(formatted.find(".i_clk") != std::string::npos);
 }
@@ -2124,7 +2124,7 @@ endmodule
         auto result = autoinst_impl(*state, 1, 12, nullptr,
                                     analyzer.project_index_snapshot().get());
         REQUIRE(result.has_value());
-        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        const auto formatted = format_autoinst(*result, top);
         CHECK(formatted.find("#(.WIDTH(16))") != std::string::npos);
         CHECK(formatted.find("u_mem") != std::string::npos);
         CHECK(formatted.find(".i_clk") != std::string::npos);
@@ -2141,7 +2141,7 @@ endmodule
         auto result = autoinst_impl(*state, 1, 12, nullptr,
                                     analyzer.project_index_snapshot().get());
         REQUIRE(result.has_value());
-        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        const auto formatted = format_autoinst(*result, top);
         CHECK(formatted.find("#(16)") != std::string::npos);
     }
 
@@ -2158,7 +2158,7 @@ endmodule
         auto result = autoinst_impl(*state, 1, 12, nullptr,
                                     analyzer.project_index_snapshot().get());
         REQUIRE(result.has_value());
-        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        const auto formatted = format_autoinst(*result, top);
         CHECK(formatted.find(".WIDTH(16)") != std::string::npos);
     }
 

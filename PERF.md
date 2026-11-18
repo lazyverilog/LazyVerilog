@@ -213,9 +213,9 @@ builders and routes every per-token lookup through it:
   visitor) carry it as a member.
 - `source_file_id_for_token` became unused and was deleted.
 
-The resolver is deliberately **not** stored in `SyntaxIndex`: `SyntaxIndex::merge`
-(`src/syntax_index.cpp`) remaps `SourceFileID`s, so a persisted buffer→id cache
-would silently return remapped-away ids after a merge.
+The resolver is deliberately **not** stored in `SyntaxIndex`: `SourceFileID`s are
+local to one index's table (`split_by_source_file()` renumbers them per shard), so
+a persisted buffer→id cache would silently return ids from another table.
 
 Measured on the same corpus and machine:
 
@@ -318,8 +318,8 @@ no-op, so it is correctness-neutral but wasteful. Skip paths already in
 *Verify:* test that queues one path twice and asserts it is parsed once.
 
 **4. Spawn the pool.** `start_background_indexer_locked()` becomes idempotent
-over N threads (spawn only the missing ones). Follow the existing
-`BackgroundCompiler::WorkerSlot` pattern (`src/background_compiler.cpp:108`)
+over N threads (spawn only the missing ones). A per-worker slot with a retire
+flag (what `BackgroundCompiler` had before it became one thread) is the pattern
 if graceful shrink-on-config-reload is wanted; a fixed pool sized at first use
 is enough for v1. Destructor joins all; `background_stop_` + `notify_all`
 already wake every waiter.

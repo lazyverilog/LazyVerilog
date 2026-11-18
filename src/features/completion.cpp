@@ -18,10 +18,6 @@
 
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
-static bool is_ident_char(char c) {
-    return std::isalnum((unsigned char)c) || c == '_' || c == '$';
-}
-
 // Convert 0-based LSP (line, character) to byte offset in text.
 //
 // `character` is a UTF-16 code unit count, not a byte count, so it cannot be
@@ -34,7 +30,7 @@ static size_t position_to_offset(const std::string& text, int line, int col) {
 // updates pos to the new start (before the word).
 static std::string backward_read_word(const std::string& text, size_t& pos) {
     const size_t end = pos;
-    while (pos > 0 && is_ident_char(text[pos - 1]))
+    while (pos > 0 && is_identifier_char(text[pos - 1]))
         --pos;
     return text.substr(pos, end - pos);
 }
@@ -44,7 +40,6 @@ static void backward_skip_ws(const std::string& text, size_t& pos) {
         --pos;
 }
 
-static std::string trim_completion_copy(std::string text);
 static std::optional<std::string> type_of_value(const SyntaxIndex& index,
                                                  const std::string& scope,
                                                  const std::string& name);
@@ -298,7 +293,7 @@ static std::optional<std::string> text_scope_base_before_double_colon(const std:
         --scan;
 
     const size_t ident_end = scan;
-    while (scan > 0 && is_ident_char(text[scan - 1]))
+    while (scan > 0 && is_identifier_char(text[scan - 1]))
         --scan;
     if (scan == ident_end)
         return std::nullopt;
@@ -319,7 +314,7 @@ static std::string text_scope_qualifier_before_double_colon(const std::string& t
     while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
         --scan;
     const size_t base_end = scan;
-    while (scan > 0 && is_ident_char(text[scan - 1]))
+    while (scan > 0 && is_identifier_char(text[scan - 1]))
         --scan;
     if (scan == base_end)
         return {};
@@ -333,7 +328,7 @@ static std::string text_scope_qualifier_before_double_colon(const std::string& t
         --scan;
 
     const size_t qualifier_end = scan;
-    while (scan > 0 && is_ident_char(text[scan - 1]))
+    while (scan > 0 && is_identifier_char(text[scan - 1]))
         --scan;
     if (scan == qualifier_end)
         return {};
@@ -632,7 +627,7 @@ static std::string infer_assignment_lhs_type_from_syntax(
             if (auto lhs_name = simple_lhs_name_from_expression(*node.left)) {
                 if (auto lhs_type = type_of_value(index, current_scope, *lhs_name)) {
                     best_operator_start = op_start;
-                    result = trim_completion_copy(*lhs_type);
+                    result = trim_copy(*lhs_type);
                 }
             }
 
@@ -773,17 +768,6 @@ syntax_named_argument_context_at_dot(const slang::syntax::SyntaxTree& tree, size
     NamedArgVisitor visitor(dot_offset);
     tree.root().visit(visitor);
     return visitor.result;
-}
-
-static std::string trim_completion_copy(std::string text) {
-    auto first =
-        std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
-    auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) {
-                    return std::isspace(c);
-                }).base();
-    if (first >= last)
-        return {};
-    return std::string(first, last);
 }
 
 // Find the byte offset of the '(' that opens the argument list enclosing
@@ -933,10 +917,6 @@ static std::string infer_current_scope(const DocumentState& state, const SyntaxI
     return infer_current_scope_from_index(index, line);
 }
 
-static std::string completion_syntax_text(const slang::syntax::SyntaxNode& node) {
-    return trim_completion_copy(node.toString());
-}
-
 static KeywordContextKind infer_keyword_context(const DocumentState& state, size_t offset) {
     if (!state.tree)
         return KeywordContextKind::General;
@@ -1030,7 +1010,7 @@ static std::optional<std::string> type_of_value(const SyntaxIndex& index,
 }
 
 static std::string completion_base_type_name(std::string type) {
-    type = trim_completion_copy(std::move(type));
+    type = trim_copy(std::move(type));
     if (type.empty())
         return {};
     const size_t paren = type.find("#(");
@@ -1043,7 +1023,7 @@ static std::string completion_base_type_name(std::string type) {
     // reduce to `logic`.
     if (const size_t scope = type.rfind("::"); scope != std::string::npos)
         type.erase(0, scope + 2);
-    type = trim_completion_copy(std::move(type));
+    type = trim_copy(std::move(type));
     // A virtual interface handle's DataTypeSyntax node text includes the
     // `virtual` (and optional `interface`) keyword ahead of the interface
     // name, e.g. `virtual lv_full_if` or `virtual interface lv_full_if`.
@@ -1053,11 +1033,11 @@ static std::string completion_base_type_name(std::string type) {
         if (type.size() > kw.size() && type.compare(0, kw.size(), kw) == 0 &&
             std::isspace(static_cast<unsigned char>(type[kw.size()]))) {
             type.erase(0, kw.size());
-            type = trim_completion_copy(std::move(type));
+            type = trim_copy(std::move(type));
         }
     }
     size_t end = 0;
-    while (end < type.size() && is_ident_char(type[end]))
+    while (end < type.size() && is_identifier_char(type[end]))
         ++end;
     return type.substr(0, end);
 }
@@ -1220,19 +1200,8 @@ static lsCompletionItem make_item(std::string label, lsCompletionItemKind kind) 
     return item;
 }
 
-// Unused.  If it is ever revived and its result reaches the client, the column
-// has to go through lsp_column() like every other LSP position.
-static std::pair<int, int> completion_ast_token_pos(const slang::SourceManager& sm,
-                                                    const slang::parsing::Token& token) {
-    if (!token || !token.location().valid())
-        return {0, 0};
-    const auto line = sm.getFileLineNumber(token.location());
-    const auto col = sm.getColumnNumber(token.location());
-    return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
-}
-
 static std::string completion_ast_text(const slang::syntax::SyntaxNode& node) {
-    return trim_completion_copy(node.toString());
+    return trim_copy(node.toString());
 }
 
 static void push_unique_item(std::vector<lsCompletionItem>& items,
@@ -1408,7 +1377,7 @@ current_file_identifier_items_from_ast(const DocumentState& state, const Complet
 }
 
 static std::string current_ast_decl_text(const slang::syntax::SyntaxNode& node) {
-    return trim_completion_copy(node.toString());
+    return trim_copy(node.toString());
 }
 
 static bool current_ast_token_before(const slang::parsing::Token& token, size_t offset) {
@@ -1436,18 +1405,6 @@ static void current_ast_add_port_item(std::vector<lsCompletionItem>& items,
                                                               : p.name + "(${1:" + p.name + "})");
     item.insertTextFormat = optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
     items.push_back(std::move(item));
-}
-
-static std::string current_ast_port_direction(const slang::syntax::PortHeaderSyntax& header) {
-    using namespace slang::syntax;
-    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return std::string(variable->direction.valueText()).empty()
-                   ? "unknown"
-                   : std::string(variable->direction.valueText());
-    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
-        return std::string(net->direction.valueText()).empty() ? "unknown"
-                                                               : std::string(net->direction.valueText());
-    return "unknown";
 }
 
 static std::string current_ast_port_type(const slang::syntax::PortHeaderSyntax& header) {
@@ -1519,7 +1476,7 @@ current_file_named_argument_items_from_ast(const DocumentState& state, const Com
                     for (const auto* port : ansi->ports) {
                         if (const auto* implicit = port ? port->as_if<ImplicitAnsiPortSyntax>() : nullptr) {
                             add(implicit->declarator->name,
-                                current_ast_port_direction(*implicit->header),
+                                port_direction(*implicit->header),
                                 current_ast_port_type(*implicit->header));
                         } else if (const auto* explicit_port =
                                        port ? port->as_if<ExplicitAnsiPortSyntax>() : nullptr) {
@@ -1534,7 +1491,7 @@ current_file_named_argument_items_from_ast(const DocumentState& state, const Com
                 const auto* port_decl = member ? member->as_if<PortDeclarationSyntax>() : nullptr;
                 if (!port_decl)
                     continue;
-                const auto direction = current_ast_port_direction(*port_decl->header);
+                const auto direction = port_direction(*port_decl->header);
                 const auto type = current_ast_port_type(*port_decl->header);
                 for (const auto* decl : port_decl->declarators) {
                     if (decl)
@@ -3055,7 +3012,7 @@ completion_document_state(const Analyzer& analyzer, const lsTextDocumentPosition
     // only a `.`, `::` or `` ` `` context reads the tree, and nvim-cmp asks on
     // every identifier keystroke while the request thread serves one at a time.
     size_t pos = position_to_offset(latest->text, params.position.line, params.position.character);
-    while (pos > 0 && is_ident_char(latest->text[pos - 1]))
+    while (pos > 0 && is_identifier_char(latest->text[pos - 1]))
         --pos;
     const char before = pos > 0 ? latest->text[pos - 1] : '\0';
     if (before != '.' && before != ':' && before != '`')
@@ -3151,15 +3108,15 @@ static std::vector<ClassParamEntry> type_arguments_of(std::string_view text) {
     if (open == std::string_view::npos)
         return args;
     const auto push = [&](std::string_view arg) {
-        std::string value = trim_completion_copy(std::string(arg));
+        std::string value = trim_copy(std::string(arg));
         std::string name;
         if (!value.empty() && value.front() == '.') {
             const size_t paren = value.find('(');
             const size_t close = value.rfind(')');
             if (paren == std::string::npos || close == std::string::npos || close < paren)
                 return;
-            name = trim_completion_copy(value.substr(1, paren - 1));
-            value = trim_completion_copy(value.substr(paren + 1, close - paren - 1));
+            name = trim_copy(value.substr(1, paren - 1));
+            value = trim_copy(value.substr(paren + 1, close - paren - 1));
         }
         args.push_back({std::move(name), std::move(value)});
     };

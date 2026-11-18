@@ -1,4 +1,5 @@
 #include "autoff.hpp"
+#include "../lsp_position.hpp"
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -129,12 +130,6 @@ static const StatementSyntax* unwrap_procedural_body(const StatementSyntax* stat
         break;
     }
     return statement;
-}
-
-static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid()) return 0;
-    auto line = sm.getFileLineNumber(tok.location());
-    return line > 0 ? (int)line - 1 : 0;
 }
 
 // Deliberately a byte column, not a UTF-16 one: the result is used to size an

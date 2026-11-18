@@ -14,6 +14,7 @@
 
 #include <slang/parsing/Token.h>
 #include <slang/syntax/SyntaxNode.h>
+#include <slang/syntax/SyntaxFwd.h>
 #include <slang/text/SourceLocation.h>
 
 namespace slang {
@@ -44,8 +45,6 @@ std::string uri_from_source_buffer(const slang::SourceManager& sm, slang::Buffer
 std::string uri_from_source_location(const slang::SourceManager& sm,
                                      slang::SourceLocation location);
 
-SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::SourceManager& sm,
-                                         slang::SourceLocation location);
 
 /// Per-index-build cache for SourceLocation buffer -> SourceFileID.
 ///
@@ -138,6 +137,16 @@ private:
 /// missing token.  Keeping this helper shared prevents each indexer / feature
 /// from making slightly different missing-token choices.
 std::string token_value_text(const slang::parsing::Token& token);
+
+/// Helpers both index builders use (closed-file shards in syntax_index.cpp, open
+/// buffers in dynamic_file_index.cpp), so the two record the same facts.
+/// `input`/`output`/... as written, or "unknown".
+std::string port_direction(const slang::syntax::PortHeaderSyntax& header);
+/// `AXI_BUS.Slave bus` -> "AXI_BUS.Slave": the interface, modport included.
+std::string interface_port_type_text(const slang::syntax::InterfacePortHeaderSyntax& header);
+/// 0-based line @p node ends on, or @p fallback_line when it has no valid end.
+int syntax_end_line0(const slang::SourceManager& sm, const slang::syntax::SyntaxNode& node,
+                     int fallback_line);
 
 bool syntax_fragment_edge_is_wordlike(char c);
 
@@ -331,9 +340,8 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
 std::unordered_set<std::string_view> collect_mentioned_names(
     std::string_view source, const slang::syntax::SyntaxTree& tree);
 
-/// Combined single-pass replacement for collect_reference_occurrences() and
-/// collect_macro_reference_occurrences().  Performs one SyntaxTree traversal
-/// instead of two by composing the macro-expansion visitToken() and the
+/// Collects reference and macro-reference occurrences in one SyntaxTree
+/// traversal, by composing the macro-expansion visitToken() and the
 /// reference-resolution visitToken() into a single CombinedVisitor.
 /// The SubroutineDeclarationCollector pre-pass still runs as a separate walk
 /// because its output (declared_subroutines) is consumed by the main visitor.

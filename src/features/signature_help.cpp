@@ -56,17 +56,6 @@ static bool same_signature(const SubroutineInfo& lhs, const SubroutineInfo& rhs)
     return true;
 }
 
-static std::string trim(std::string text) {
-    auto first =
-        std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
-    auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) {
-                    return std::isspace(c);
-                }).base();
-    if (first >= last)
-        return {};
-    return std::string(first, last);
-}
-
 static std::string token_text(const parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
 }
@@ -74,16 +63,15 @@ static std::string token_text(const parsing::Token& token) {
 static std::string name_text(const NameSyntax& name) {
     if (const auto* ident = name.as_if<IdentifierNameSyntax>())
         return token_text(ident->identifier);
-    return trim(name.toString());
+    return trim_copy(name.toString());
 }
 
-static bool is_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; }
 
 static std::string ident_before(std::string_view text, size_t end) {
     while (end > 0 && std::isspace((unsigned char)text[end - 1]))
         --end;
     size_t start = end;
-    while (start > 0 && is_ident_char(text[start - 1]))
+    while (start > 0 && is_identifier_char(text[start - 1]))
         --start;
     if (start == end)
         return {};
@@ -95,7 +83,7 @@ static std::optional<std::string> dotted_ident_before(std::string_view text, siz
         --end;
     size_t name_end = end;
     size_t name_start = name_end;
-    while (name_start > 0 && is_ident_char(text[name_start - 1]))
+    while (name_start > 0 && is_identifier_char(text[name_start - 1]))
         --name_start;
     if (name_start == name_end)
         return std::nullopt;
@@ -110,7 +98,7 @@ static std::optional<std::string> dotted_ident_before(std::string_view text, siz
     size_t before_dot = dot - 1;
     while (before_dot > 0 && std::isspace((unsigned char)text[before_dot - 1]))
         --before_dot;
-    if (before_dot > 0 && (is_ident_char(text[before_dot - 1]) || text[before_dot - 1] == ']'))
+    if (before_dot > 0 && (is_identifier_char(text[before_dot - 1]) || text[before_dot - 1] == ']'))
         return std::nullopt;
     return std::string(text.substr(name_start, name_end - name_start));
 }
@@ -171,7 +159,7 @@ static SubroutineInfo subroutine_info_from_prototype(const FunctionPrototypeSynt
     SubroutineInfo info;
     info.kind = prototype.keyword.kind == parsing::TokenKind::TaskKeyword ? "task" : "function";
     if (info.kind == "function")
-        info.return_type = trim(prototype.returnType->toString());
+        info.return_type = trim_copy(prototype.returnType->toString());
     if (prototype.portList) {
         for (const auto* port_base : prototype.portList->ports) {
             const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
@@ -181,9 +169,9 @@ static SubroutineInfo subroutine_info_from_prototype(const FunctionPrototypeSynt
             param.name = token_text(port->declarator->name);
             param.direction = token_text(port->direction);
             if (port->dataType)
-                param.type = trim(port->dataType->toString());
+                param.type = trim_copy(port->dataType->toString());
             if (port->declarator->initializer)
-                param.default_value = trim(port->declarator->initializer->expr->toString());
+                param.default_value = trim_copy(port->declarator->initializer->expr->toString());
             if (!param.name.empty())
                 info.args.push_back(std::move(param));
         }
@@ -195,7 +183,7 @@ static SubroutineInfo subroutine_info_from_declaration(const FunctionDeclaration
     SubroutineInfo info;
     info.kind = node.kind == SyntaxKind::TaskDeclaration ? "task" : "function";
     if (info.kind == "function")
-        info.return_type = trim(node.prototype->returnType->toString());
+        info.return_type = trim_copy(node.prototype->returnType->toString());
 
     if (node.prototype->portList) {
         for (const auto* port_base : node.prototype->portList->ports) {
@@ -206,9 +194,9 @@ static SubroutineInfo subroutine_info_from_declaration(const FunctionDeclaration
             param.name = token_text(port->declarator->name);
             param.direction = token_text(port->direction);
             if (port->dataType)
-                param.type = trim(port->dataType->toString());
+                param.type = trim_copy(port->dataType->toString());
             if (port->declarator->initializer)
-                param.default_value = trim(port->declarator->initializer->expr->toString());
+                param.default_value = trim_copy(port->declarator->initializer->expr->toString());
             if (!param.name.empty())
                 info.args.push_back(std::move(param));
         }
@@ -335,7 +323,7 @@ static std::optional<std::vector<ParamInfo>> module_params_from_tree(const Synta
                         base ? base->as_if<ParameterDeclarationSyntax>() : nullptr;
                     if (!parameter)
                         continue;
-                    const auto type = trim(parameter->type->toString());
+                    const auto type = trim_copy(parameter->type->toString());
                     for (const auto* decl : parameter->declarators) {
                         if (!decl)
                             continue;
@@ -472,15 +460,6 @@ static std::vector<std::string> split_top_level_commas(std::string_view text) {
     return parts;
 }
 
-static std::string trim_ws(std::string_view text) {
-    size_t b = 0, e = text.size();
-    while (b < e && std::isspace((unsigned char)text[b]))
-        ++b;
-    while (e > b && std::isspace((unsigned char)text[e - 1]))
-        --e;
-    return std::string(text.substr(b, e - b));
-}
-
 /// `input bit [7:0] addr = 8'h0` -> direction/type/name/default.
 ///
 /// The declared name is the last identifier before any unpacked dimensions, so
@@ -488,7 +467,7 @@ static std::string trim_ws(std::string_view text) {
 /// type exactly as the source spelled them.
 static ParamInfo parse_arg_text(const std::string& raw) {
     ParamInfo info;
-    std::string text = trim_ws(raw);
+    std::string text = trim_copy(std::string(raw));
 
     // Default value first: everything after a top-level '='.
     int depth = 0;
@@ -499,8 +478,8 @@ static ParamInfo parse_arg_text(const std::string& raw) {
         else if (c == ')' || c == ']' || c == '}')
             --depth;
         else if (c == '=' && depth == 0) {
-            info.default_value = trim_ws(std::string_view(text).substr(i + 1));
-            text = trim_ws(std::string_view(text).substr(0, i));
+            info.default_value = trim_copy(std::string(std::string_view(text).substr(i + 1)));
+            text = trim_copy(std::string(std::string_view(text).substr(0, i)));
             break;
         }
     }
@@ -512,14 +491,14 @@ static ParamInfo parse_arg_text(const std::string& raw) {
         if (open == std::string::npos)
             break;
         trailing_dims = text.substr(open) + trailing_dims;
-        text = trim_ws(std::string_view(text).substr(0, open));
+        text = trim_copy(std::string(std::string_view(text).substr(0, open)));
     }
 
     size_t end = text.size();
-    while (end > 0 && is_ident_char(text[end - 1]))
+    while (end > 0 && is_identifier_char(text[end - 1]))
         --end;
     info.name = text.substr(end);
-    std::string lead = trim_ws(std::string_view(text).substr(0, end));
+    std::string lead = trim_copy(std::string(std::string_view(text).substr(0, end)));
 
     static const char* kDirections[] = {"input", "output", "inout", "ref", nullptr};
     for (int i = 0; kDirections[i]; ++i) {
@@ -527,7 +506,7 @@ static ParamInfo parse_arg_text(const std::string& raw) {
         if (lead.rfind(dir, 0) == 0 &&
             (lead.size() == dir.size() || std::isspace((unsigned char)lead[dir.size()]))) {
             info.direction = dir;
-            lead = trim_ws(std::string_view(lead).substr(dir.size()));
+            lead = trim_copy(lead.substr(dir.size()));
             break;
         }
     }
@@ -550,16 +529,16 @@ static std::optional<SubroutineInfo> subroutine_from_index_signature(const std::
     // The port list is rendered one argument per line for readability; commas
     // still separate them, so newlines can collapse to spaces.
     std::replace(body.begin(), body.end(), '\n', ' ');
-    body = trim_ws(body);
+    body = trim_copy(std::string(body));
 
     const size_t open = body.find('(');
-    std::string header = trim_ws(open == std::string::npos ? body : body.substr(0, open));
+    std::string header = trim_copy(std::string(open == std::string::npos ? body : body.substr(0, open)));
     std::string ports;
     if (open != std::string::npos) {
         const size_t close = body.rfind(')');
         if (close == std::string::npos || close < open)
             return std::nullopt;
-        ports = trim_ws(body.substr(open + 1, close - open - 1));
+        ports = trim_copy(std::string(body.substr(open + 1, close - open - 1)));
     }
 
     SubroutineInfo info;
@@ -572,15 +551,15 @@ static std::optional<SubroutineInfo> subroutine_from_index_signature(const std::
 
     // Strip the keyword and the trailing declared name; what remains is the
     // return type ("" for a task).
-    header = trim_ws(std::string_view(header).substr(info.kind.size()));
+    header = trim_copy(header.substr(info.kind.size()));
     if (header.size() >= name.size() &&
         header.compare(header.size() - name.size(), name.size(), name) == 0)
-        header = trim_ws(std::string_view(header).substr(0, header.size() - name.size()));
+        header = trim_copy(header.substr(0, header.size() - name.size()));
     info.return_type = header;
 
     if (!ports.empty()) {
         for (const auto& part : split_top_level_commas(ports)) {
-            const std::string trimmed = trim_ws(part);
+            const std::string trimmed = trim_copy(std::string(part));
             if (!trimmed.empty())
                 info.args.push_back(parse_arg_text(trimmed));
         }
@@ -654,12 +633,12 @@ static std::optional<SubroutineInfo> method_at_index_declaration(const SyntaxInd
             SubroutineInfo info;
             info.kind = method.is_task ? "task" : "function";
             info.return_type = method.return_type;
-            std::string ports = trim_ws(method.params);
+            std::string ports = trim_copy(std::string(method.params));
             if (ports.size() >= 2 && ports.front() == '(' && ports.back() == ')')
-                ports = trim_ws(std::string_view(ports).substr(1, ports.size() - 2));
+                ports = trim_copy(ports.substr(1, ports.size() - 2));
             if (!ports.empty()) {
                 for (const auto& part : split_top_level_commas(ports)) {
-                    const std::string trimmed = trim_ws(part);
+                    const std::string trimmed = trim_copy(std::string(part));
                     if (!trimmed.empty())
                         info.args.push_back(parse_arg_text(trimmed));
                 }

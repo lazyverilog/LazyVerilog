@@ -33,13 +33,6 @@ static lsWorkspaceEdit make_range_edit(const std::string& uri, int start_line, i
     return we;
 }
 
-static std::string format_emit_text(const std::string& text, const FormatOptions& options) {
-    std::string formatted = format_source(text, options);
-    while (!formatted.empty() && formatted.back() == '\n')
-        formatted.pop_back();
-    return formatted;
-}
-
 static size_t lsp_offset(const std::string& text, int line, int col) {
     int cur = 0;
     size_t pos = 0;
@@ -106,13 +99,6 @@ static std::string indent_replacement_lines(const std::string& text, const std::
     return out;
 }
 
-static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid())
-        return 0;
-    auto line = sm.getFileLineNumber(tok.location());
-    return line > 0 ? (int)line - 1 : 0;
-}
-
 // True when `line` falls inside a class body.  The RTL generators below emit
 // net declarations and always_ff/always_comb blocks, none of which are legal
 // class items, so offering them there is pure noise.  Interfaces and programs
@@ -177,7 +163,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                                         project_index.get());
             if (result) {
                 std::string formatted = indent_replacement_lines(
-                    format_emit_text(format_autoinst(*result, state->text, config.autoinst),
+                    format_emit_text(format_autoinst(*result, state->text),
                                      config.format),
                     leading_whitespace_of_line(state->text, result->line_start));
                 // Replace the instantiation range
@@ -199,7 +185,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     // ── 2. AutoArg ───────────────────────────────────────────────────────────
     try {
         if (state->tree) {
-            auto result = autoarg_impl(*state, line, col);
+            auto result = autoarg_impl(*state, line);
             if (result) {
                 size_t line_start = lsp_offset(state->text, result->open_line, 0);
                 size_t open = lsp_offset(state->text, result->open_line, result->open_col);
@@ -265,7 +251,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             cmd.command = "lazyverilog.autoffPreview";
             // args: [uri, line] — encode as JSON
             lsp::Any uri_arg, line_arg;
-            uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
+            uri_arg.SetJsonString(json_quoted(uri), lsp::Any::kUnKnown);
             line_arg.SetJsonString(std::to_string(line), lsp::Any::kUnKnown);
             cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg, line_arg});
             action.command = optional<lsCommandWithAny>(cmd);
@@ -285,7 +271,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             cmd.title = "AutoWire: declare missing signals";
             cmd.command = "lazyverilog.autowire";
             lsp::Any uri_arg, line_arg;
-            uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
+            uri_arg.SetJsonString(json_quoted(uri), lsp::Any::kUnKnown);
             line_arg.SetJsonString(std::to_string(line), lsp::Any::kUnKnown);
             cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg, line_arg});
             action.command = optional<lsCommandWithAny>(cmd);
@@ -305,7 +291,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             cmd.title = "AutoFF All";
             cmd.command = "lazyverilog.autoffAllPreview";
             lsp::Any uri_arg;
-            uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
+            uri_arg.SetJsonString(json_quoted(uri), lsp::Any::kUnKnown);
             cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
             action.command = optional<lsCommandWithAny>(cmd);
             actions.push_back(std::move(action));

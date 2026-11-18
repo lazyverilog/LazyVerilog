@@ -33,8 +33,4 @@ std::optional<AutoinstResult> autoinst_impl(
     std::span<const OpenIndexShard> opened_shards,
     const ProjectIndexSnapshot* project_index = nullptr);
 
-std::string format_autoinst(
-    const AutoinstResult& result, const std::string& source, const AutoinstOptions& options);
-
-std::map<std::string, std::string> autoinst_parse_connections(
-    const std::string& source, int line_start, int line_end);
+std::string format_autoinst(const AutoinstResult& result, const std::string& source);

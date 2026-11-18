@@ -473,10 +473,11 @@ include_directories(${LAZYVERILOG_GENERATED_DIR})
 # ──────────────────────────────────────────────────────────────────────────────
 # Main LSP server binary
 # ──────────────────────────────────────────────────────────────────────────────
-set(LAZYVERILOG_SOURCES
-    src/main.cpp
+# Everything but the server's own two files, compiled once and linked into the
+# server, the tests and the CLI tools.  A static library, so each binary takes
+# only the objects it references.
+add_library(lazyverilog-core STATIC
     src/banner.cpp
-    src/server.cpp
     src/config.cpp
     src/cpu_budget.cpp
     src/filelist.cpp
@@ -516,19 +517,20 @@ set(LAZYVERILOG_SOURCES
     src/features/code_action.cpp
     src/features/folding_range.cpp
 )
-
-add_executable(lazyverilog-lsp ${LAZYVERILOG_SOURCES})
-target_include_directories(lazyverilog-lsp PRIVATE
+target_include_directories(lazyverilog-core PUBLIC
     src
     ${lspcpp_SOURCE_DIR}/include
     ${LAZYVERILOG_RAPIDJSON_INCLUDE}
 )
-target_link_libraries(lazyverilog-lsp
-    PRIVATE
+target_link_libraries(lazyverilog-core
+    PUBLIC
         slang::slang
         lspcpp
         tomlplusplus::tomlplusplus
 )
+
+add_executable(lazyverilog-lsp src/main.cpp src/server.cpp)
+target_link_libraries(lazyverilog-lsp PRIVATE lazyverilog-core)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Test binary (Catch2)
@@ -577,133 +579,33 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_document_symbols.cpp
     tests/test_invariants.cpp
     tests/test_opentitan_benchmark.cpp
-    # Feature sources needed by tests (no LSP protocol dependency)
-    src/features/completion.cpp
-    src/features/code_action.cpp
-    src/features/autoinst.cpp
-    src/features/autoarg.cpp
-    src/config.cpp
-    src/cpu_budget.cpp
-    src/filelist.cpp
-    src/analyzer.cpp
-    src/dynamic_file_index.cpp
-    src/background_compiler.cpp
-    src/syntax_index.cpp
-    src/syntax_index_shared.cpp
-    src/index_cache.cpp
-    src/project_root.cpp
-    src/implicit_project.cpp
-    src/parse_inputs.cpp
-    src/fix_apply.cpp
-    src/features/fix_slang.cpp
-    src/edit_watermark.cpp
-    src/position_encoding.cpp
-    src/features/formatter.cpp
-    src/features/lint.cpp
-    src/features/lint_codes.cpp
-    src/features/autoff.cpp
-    src/features/autofunc.cpp
-    src/features/autowire.cpp
-    src/features/connect.cpp
-    src/features/inlay_hints.cpp
-    src/features/references.cpp
-    src/features/document_highlight.cpp
-    src/features/selection_range.cpp
-    src/features/rename.cpp
-    src/features/hover.cpp
-    src/features/signature_help.cpp
-    src/features/workspace_symbols.cpp
-    src/features/document_symbols.cpp
-    src/features/folding_range.cpp
 )
 
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
 target_compile_definitions(lazyverilog-tests PRIVATE LAZYVERILOG_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_include_directories(lazyverilog-tests PRIVATE
-    src
-    tests
-    ${lspcpp_SOURCE_DIR}/include
-    ${LAZYVERILOG_RAPIDJSON_INCLUDE}
-)
-target_link_libraries(lazyverilog-tests
-    PRIVATE
-        slang::slang
-        lspcpp
-        tomlplusplus::tomlplusplus
-        Catch2::Catch2WithMain
-)
+target_include_directories(lazyverilog-tests PRIVATE tests)
+target_link_libraries(lazyverilog-tests PRIVATE lazyverilog-core Catch2::Catch2WithMain)
 
 include(Catch)
 catch_discover_tests(lazyverilog-tests)
 
-add_executable(parse-bench
-    tools/parse_bench.cpp
-    src/banner.cpp
-    src/dynamic_file_index.cpp
-    src/syntax_index.cpp
-    src/syntax_index_shared.cpp
-    src/index_cache.cpp
-    src/project_root.cpp
-    src/parse_inputs.cpp)
-target_include_directories(parse-bench PRIVATE src)
-target_link_libraries(parse-bench PRIVATE slang::slang)
+add_executable(parse-bench tools/parse_bench.cpp)
+target_link_libraries(parse-bench PRIVATE lazyverilog-core)
 
-add_executable(index-bench
-    tools/index_bench.cpp
-    src/banner.cpp
-    src/analyzer.cpp
-    src/config.cpp
-    src/cpu_budget.cpp
-    src/filelist.cpp
-    src/dynamic_file_index.cpp
-    src/implicit_project.cpp
-    src/syntax_index.cpp
-    src/syntax_index_shared.cpp
-    src/index_cache.cpp
-    src/project_root.cpp
-    src/parse_inputs.cpp
-    src/features/fix_slang.cpp)
-target_include_directories(index-bench PRIVATE src)
-target_link_libraries(index-bench PRIVATE slang::slang tomlplusplus::tomlplusplus)
+add_executable(index-bench tools/index_bench.cpp)
+target_link_libraries(index-bench PRIVATE lazyverilog-core)
 
-add_executable(lazyverilog-fmt tools/fmt_file.cpp src/banner.cpp
-               src/features/formatter.cpp src/config.cpp)
-target_include_directories(lazyverilog-fmt PRIVATE src)
-target_link_libraries(lazyverilog-fmt PRIVATE slang::slang tomlplusplus::tomlplusplus)
+add_executable(lazyverilog-fmt tools/fmt_file.cpp)
+target_link_libraries(lazyverilog-fmt PRIVATE lazyverilog-core)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# lazyverilog-lint / lazyverilog-rtltree CLI tools
-# Share the same project-bootstrap sources as the LSP server (minus main.cpp,
-# server.cpp, and LspCpp) so they see the same parse/lint/compile/rtl-tree
-# behavior as `lazyverilog-lsp` for the same lazyverilog.toml.
-# ──────────────────────────────────────────────────────────────────────────────
-set(LAZYVERILOG_CLI_PROJECT_SOURCES
-    tools/cli_project.cpp
-    src/banner.cpp
-    src/config.cpp
-    src/filelist.cpp
-    src/analyzer.cpp
-    src/cpu_budget.cpp
-    src/dynamic_file_index.cpp
-    src/background_compiler.cpp
-    src/syntax_index.cpp
-    src/syntax_index_shared.cpp
-    src/index_cache.cpp
-    src/project_root.cpp
-    src/parse_inputs.cpp
-    src/fix_apply.cpp
-    src/features/fix_slang.cpp
-    src/features/lint.cpp
-    src/features/lint_codes.cpp
-)
+# The project bootstrap the lint and rtltree CLIs share.
+add_executable(lazyverilog-lint tools/lint_file.cpp tools/cli_project.cpp)
+target_include_directories(lazyverilog-lint PRIVATE tools)
+target_link_libraries(lazyverilog-lint PRIVATE lazyverilog-core)
 
-add_executable(lazyverilog-lint tools/lint_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
-target_include_directories(lazyverilog-lint PRIVATE src tools)
-target_link_libraries(lazyverilog-lint PRIVATE slang::slang tomlplusplus::tomlplusplus)
-
-add_executable(lazyverilog-rtltree tools/rtltree_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
-target_include_directories(lazyverilog-rtltree PRIVATE src tools)
-target_link_libraries(lazyverilog-rtltree PRIVATE slang::slang tomlplusplus::tomlplusplus)
+add_executable(lazyverilog-rtltree tools/rtltree_file.cpp tools/cli_project.cpp)
+target_include_directories(lazyverilog-rtltree PRIVATE tools)
+target_link_libraries(lazyverilog-rtltree PRIVATE lazyverilog-core)
 
 add_executable(lazyverilog-rtl-format-test tests/rtl_format_sweep.cpp)
 add_test(

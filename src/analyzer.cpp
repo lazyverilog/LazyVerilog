@@ -5000,26 +5000,6 @@ static slang::SourceRange visible_range_for_token(const slang::SourceManager& sm
     return token.range();
 }
 
-static bool contains_position(const slang::SourceManager& sm, slang::SourceRange range, int line,
-                              int col) {
-    if (!range.start().valid() || !range.end().valid())
-        return false;
-
-    // Compared against a request position, which the client measures in UTF-16.
-    const int start_line = to_lsp_line((int)sm.getFileLineNumber(range.start()));
-    const int start_col = lsp_column(sm, range.start());
-    const int end_line = to_lsp_line((int)sm.getFileLineNumber(range.end()));
-    const int end_col = lsp_column(sm, range.end());
-
-    if (line < start_line || line > end_line)
-        return false;
-    if (line == start_line && col < start_col)
-        return false;
-    if (line == end_line && col >= end_col)
-        return false;
-    return true;
-}
-
 static bool range_starts_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
                                 const std::string& uri) {
     if (!range.start().valid())
@@ -5027,16 +5007,8 @@ static bool range_starts_in_uri(const slang::SourceManager& sm, slang::SourceRan
     return location_to_uri(sm, range.start(), uri) == uri;
 }
 
-static bool contains_position_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
-                                     const std::string& uri, int line, int col) {
-    // Position first: deriving a URI converts the buffer's path, which per
-    // visited token dominated identifier_at / references / definition.
-    return contains_position(sm, range, line, col) && range_starts_in_uri(sm, range, uri);
-}
-
 /// Indices [first, last) of the @p cursors (sorted (line, col) pairs) that
-/// @p range contains, or none when the range does not start in @p uri: the
-/// containment contains_position_in_uri() tests, for many cursors at once.
+/// @p range contains, or none when the range does not start in @p uri.
 static std::pair<size_t, size_t> cursor_span(const slang::SourceManager& sm,
                                              const std::vector<std::pair<int, int>>& cursors,
                                              slang::SourceRange range, const std::string& uri) {
@@ -5158,13 +5130,6 @@ static bool cursors_in_define(const slang::syntax::SyntaxTree& tree,
         }
     }
     return false;
-}
-
-static bool token_contains_position_in_uri(const slang::SourceManager& sm,
-                                           const slang::parsing::Token& token,
-                                           const std::string& uri, int line, int col) {
-    return token && token.location().valid() &&
-           contains_position_in_uri(sm, visible_range_for_token(sm, token), uri, line, col);
 }
 
 enum class DefinitionTargetKind {
@@ -6037,36 +6002,8 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
         // typedef/enum/struct
         auto tit = idx.typedef_by_name.find(target.name);
         if (tit != idx.typedef_by_name.end()) {
-            const auto& td = idx.typedefs[tit->second];
-            std::string detail;
-            if (td.is_enum) {
-                detail = "enum " + td.resolved;
-                if (!td.enum_members.empty()) {
-                    detail += " {";
-                    for (size_t i = 0; i < td.enum_members.size(); ++i) {
-                        if (i)
-                            detail += ", ";
-                        detail += td.enum_members[i].name;
-                    }
-                    detail += "}";
-                }
-            } else if (td.is_struct) {
-                detail = "struct packed";
-                if (!td.fields.empty()) {
-                    detail += " {";
-                    for (const auto& f : td.fields) {
-                        detail += " " + f.type + " " + f.name + ";";
-                    }
-                    detail += " }";
-                }
-            } else {
-                detail = td.resolved;
-            }
-            return SymbolInfo{.name = target.name,
-                              .kind = "typedef",
-                              .detail = detail,
-                              .line = definition.line,
-                              .col = definition.col};
+            return symbol_info_for_typedef_entry(idx.typedefs[tit->second], target.name,
+                                                 definition);
         }
         // variable/net/parameter/localparam
         for (const auto& v : idx.values) {
@@ -8553,43 +8490,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     return result;
 }
 
-std::vector<std::pair<int, int>> Analyzer::find_occurrences(const std::string& uri,
-                                                            const std::string& name) const {
-    auto state = get_state(uri);
-    if (!state || name.empty())
-        return {};
-
-    std::string_view src = state->text;
-    auto is_id = [](char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; };
-
-    // Build line-start offsets
-    std::vector<size_t> ls;
-    ls.push_back(0);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (src[i] == '\n')
-            ls.push_back(i + 1);
-
-    std::vector<std::pair<int, int>> result;
-    size_t pos = 0;
-    while (pos < src.size()) {
-        auto found = src.find(name, pos);
-        if (found == std::string_view::npos)
-            break;
-
-        bool before_ok = (found == 0) || !is_id(src[found - 1]);
-        bool after_ok = (found + name.size() >= src.size()) || !is_id(src[found + name.size()]);
-
-        if (before_ok && after_ok) {
-            auto it = std::upper_bound(ls.begin(), ls.end(), found);
-            int line = (int)(it - ls.begin()) - 1; // 0-based
-            int col = (int)(found - ls[(size_t)line]);
-            result.push_back({line, col});
-        }
-        pos = found + 1;
-    }
-    return result;
-}
-
 void Analyzer::set_project_index_publish_debounce_ms(int debounce_ms) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     background_publish_debounce_ms_ = std::max(0, debounce_ms);
@@ -8682,20 +8582,6 @@ void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (reindex == Reindex::Now && !extra_files_.empty())
-        schedule_background_reindex_locked();
-}
-
-void Analyzer::set_defines(const std::vector<std::string>& defines) {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    auto inputs = parse_inputs_->defaults();
-    inputs.defines = defines;
-    inputs.config_digest = IndexCache::config_digest(inputs.defines, inputs.include_dir_paths);
-    replace_default_parse_inputs_locked(std::move(inputs));
-    // Invalidate extra-file cache so reopened files pick up the new defines.
-    clear_extra_cache_locked();
-    invalidate_extra_snapshots_locked();
-    clear_project_index_snapshot_locked();
-    if (!extra_files_.empty())
         schedule_background_reindex_locked();
 }
 
@@ -8920,40 +8806,47 @@ void Analyzer::drain_shard_writes_inline() const {
             index_cache_write_queue_.pop_front();
             index_cache_writing_ = true;
         }
-
-        // Same generation check the writer thread makes: a shard keyed on
-        // defines that have since moved would serve the wrong index.
-        bool current_generation = false;
-        {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            current_generation = write.generation == background_generation_;
-        }
-        // See index_cache_writer_loop(): `index_cache_writing_` is set and
-        // something may be waiting on it, and on a one-CPU slice this runs on
-        // the indexing worker, which is a thread function too.
-        try {
-            if (current_generation) {
-                if (write.index) {
-                    store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                         write.extra_dependency_uri, write.stands_alone);
-                }
-                if (write.prune_only)
-                    prune_cache_once_per_generation(write.generation, write.live_uris);
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
-        } catch (...) {
-            std::cerr << "[lazyverilog] index cache write failed\n";
-        }
-
-        // Drop the shard before reporting idle.  Destroyed at the end of the
-        // iteration instead, it outlived wait_for_index_cache_writes_idle(),
-        // so a caller could still see a replaced shard alive after the wait.
-        write = PendingShardWrite{};
-        std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
-        index_cache_writing_ = false;
-        index_cache_write_cv_.notify_all();
+        perform_shard_write(std::move(write));
     }
+}
+
+void Analyzer::perform_shard_write(PendingShardWrite write) const {
+    // A generation bump means the config moved, so this shard would be
+    // keyed on defines that are no longer current.  Dropping it costs one
+    // reparse next launch; writing it would serve the wrong index.
+    bool current_generation = false;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        current_generation = write.generation == background_generation_;
+    }
+
+    // `index_cache_writing_` is set, and wait_for_index_cache_writes_idle()
+    // waits on it, so anything thrown here would park that caller forever --
+    // after taking the process down, since both callers are thread functions
+    // (on a one-CPU slice this runs on the indexing worker).  A write that
+    // fails is a cache miss next launch, which is what a cache that cannot be
+    // written has always meant.
+    try {
+        if (current_generation) {
+            if (write.index)
+                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                     write.extra_dependency_uri, write.stands_alone);
+            if (write.prune_only)
+                prune_cache_once_per_generation(write.generation, write.live_uris);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[lazyverilog] index cache write failed\n";
+    }
+
+    // Drop the shard before reporting idle.  Destroyed on return instead, it
+    // outlived wait_for_index_cache_writes_idle(), so a caller could still see
+    // a replaced shard alive after the wait.
+    write = PendingShardWrite{};
+    std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
+    index_cache_writing_ = false;
+    index_cache_write_cv_.notify_all();
 }
 
 void Analyzer::queue_shard_write(PendingShardWrite write) const {
@@ -9004,47 +8897,7 @@ void Analyzer::index_cache_writer_loop() const {
             index_cache_write_queue_.pop_front();
             index_cache_writing_ = true;
         }
-
-        // A generation bump means the config moved, so this shard would be
-        // keyed on defines that are no longer current.  Dropping it costs one
-        // reparse next launch; writing it would serve the wrong index.
-        bool current_generation = false;
-        {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            current_generation = write.generation == background_generation_;
-        }
-        if (!current_generation) {
-            write = PendingShardWrite{}; // released before "idle", as below
-            std::lock_guard<std::mutex> write_lock(index_cache_write_mutex_);
-            index_cache_writing_ = false;
-            index_cache_write_cv_.notify_all();
-            continue;
-        }
-
-        // `index_cache_writing_` is set, and wait_for_index_cache_writes_idle()
-        // waits on it, so anything thrown here would park that caller forever --
-        // after taking the process down, since this is a thread function.  A
-        // write that fails is a cache miss next launch, which is what a cache
-        // that cannot be written has always meant.
-        try {
-            if (write.index)
-                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                     write.extra_dependency_uri, write.stands_alone);
-            if (write.prune_only)
-                prune_cache_once_per_generation(write.generation, write.live_uris);
-        } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
-        } catch (...) {
-            std::cerr << "[lazyverilog] index cache write failed\n";
-        }
-
-        // Drop the shard before reporting idle.  Destroyed at the end of the
-        // iteration instead, it outlived wait_for_index_cache_writes_idle(),
-        // so a caller could still see a replaced shard alive after the wait.
-        write = PendingShardWrite{};
-        std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
-        index_cache_writing_ = false;
-        index_cache_write_cv_.notify_all();
+        perform_shard_write(std::move(write));
     }
 }
 
@@ -10435,7 +10288,10 @@ void build_rtl_parent_adjacency(RtlIndexView& view) {
 
 } // namespace
 
-std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
+// Shared start of rtl_tree() and rtl_tree_reverse(): fill @p view from every
+// open buffer and project shard, and name the first module declared in @p uri.
+template <class View>
+std::optional<std::string> Analyzer::rtl_view_for(const std::string& uri, View& view) const {
     auto state = get_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
@@ -10454,7 +10310,6 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
         extra_snapshot = extra_file_snapshot_locked();
     }
 
-    RtlIndexView view;
     std::unordered_set<std::string> seen_uris;
     for (const auto& [state_uri, state_snapshot] : open_states) {
         if (state_snapshot && state_snapshot->tree)
@@ -10462,13 +10317,21 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     }
     for (const auto& extra : *extra_snapshot)
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index_ref());
-    build_rtl_parent_adjacency(view);
 
     const auto* root = &state_index.modules.front();
     for (const auto& module : state_index.modules) {
         if (module.line > 0 && (root->line <= 0 || module.line < root->line))
             root = &module;
     }
+    return root->name;
+}
+
+std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
+    RtlIndexView view;
+    const auto root_name = rtl_view_for(uri, view);
+    if (!root_name)
+        return std::nullopt;
+    build_rtl_parent_adjacency(view);
 
     std::function<RtlTreeNode(const std::string&, size_t, std::unordered_set<std::string>&)> build =
         [&](const std::string& module_name, size_t depth,
@@ -10509,42 +10372,14 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     };
 
     std::unordered_set<std::string> seen;
-    return build(root->name, 0, seen);
+    return build(*root_name, 0, seen);
 }
 
 std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) const {
-    auto state = get_state(uri);
-    if (!state || !state->tree)
-        return std::nullopt;
-    // By reference, for the reason above.
-    const auto& state_index = get_structural_index(*state);
-    if (state_index.modules.empty())
-        return std::nullopt;
-
-    std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
-    std::shared_ptr<const std::vector<ExtraFileInfo>> extra_snapshot;
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        open_states.reserve(docs_.size());
-        for (const auto& [state_uri, state_snapshot] : docs_)
-            open_states.emplace_back(state_uri, state_snapshot);
-        extra_snapshot = extra_file_snapshot_locked();
-    }
-
     RtlIndexView view;
-    std::unordered_set<std::string> seen_uris;
-    for (const auto& [state_uri, state_snapshot] : open_states) {
-        if (state_snapshot && state_snapshot->tree)
-            add_rtl_index_file(view, seen_uris, state_uri, get_structural_index(*state_snapshot));
-    }
-    for (const auto& extra : *extra_snapshot)
-        add_rtl_index_file(view, seen_uris, extra.uri, extra.index_ref());
-
-    const auto* target = &state_index.modules.front();
-    for (const auto& module : state_index.modules) {
-        if (module.line > 0 && (target->line <= 0 || module.line < target->line))
-            target = &module;
-    }
+    const auto target_name = rtl_view_for(uri, view);
+    if (!target_name)
+        return std::nullopt;
 
     struct ParentRef {
         std::string parent_module;
@@ -10601,7 +10436,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
     };
 
     std::unordered_set<std::string> seen;
-    return build(target->name, 0, seen);
+    return build(*target_name, 0, seen);
 }
 
 bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {

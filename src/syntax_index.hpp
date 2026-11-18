@@ -387,8 +387,7 @@ std::string package_scoped_name(std::string_view written);
 
 struct SyntaxIndex {
     // Per-index file table.  All source-backed entries store SourceFileID
-    // instead of repeating URI strings.  merge() remaps IDs from shard-local
-    // tables into the merged table.
+    // instead of repeating URI strings.  IDs are local to this index's table.
     std::vector<std::string> source_files;
     // Reverse table for intern_source_file().  This keeps per-token and
     // per-reference file attribution O(1) instead of linearly scanning
@@ -480,20 +479,8 @@ struct SyntaxIndex {
     /// Scope context that is not itself file-attributed — the set of package
     /// names, and the package-scoped lookup keys — is carried into every shard
     /// that keeps an entry, because a class declared in a header is still a
-    /// member of the package the includer opened, and merge() re-derives those
-    /// keys from what the shard says about its own scopes.
+    /// member of the package the includer opened.
     std::vector<SyntaxIndex> split_by_source_file(const std::vector<std::string>& uris) const;
-
-    /// Merge all collections from @p other into this index, remapping its
-    /// SourceFileIDs into this one's table.
-    ///
-    /// No request path calls this, and none should: the project model is that a
-    /// handler consumes per-file shards from a published snapshot rather than a
-    /// merged whole, because merging is O(project) work that would then happen
-    /// per request.  What it still carries is a constraint -- it renumbers
-    /// SourceFileIDs, which is why no buffer-to-id cache may be stored inside a
-    /// SyntaxIndex (see PERF.md).  Only tests call it today.
-    void merge(const SyntaxIndex& other);
 
     SourceFileID intern_source_file(std::string uri);
     std::string source_uri(SourceFileID file_id) const;

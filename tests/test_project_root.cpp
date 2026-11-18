@@ -757,7 +757,6 @@ std::string semantic_messages(Analyzer& analyzer) {
 
     BackgroundCompilerConfig config;
     config.enabled = true;
-    config.thread_count = 1;
     compiler.configure(config);
     // No coalescing window: one scheduled generation, waited on below.
     compiler.compile_now();
