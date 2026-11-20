@@ -1,0 +1,56 @@
+{
+  "comments": {
+    "lineComment": "//",
+    "blockComment": ["/*", "*/"]
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["`ifdef", "`endif"],
+    ["`ifndef", "`endif"],
+    ["`celldefine", "`endcelldefine"],
+    ["`begin_keywords", "`end_keywords"],
+    ["`uvm_object_utils_begin", "`uvm_object_utils_end"],
+    ["`uvm_object_param_utils_begin", "`uvm_object_utils_end"],
+    ["`uvm_object_abstract_utils_begin", "`uvm_object_utils_end"],
+    ["`uvm_object_abstract_param_utils_begin", "`uvm_object_utils_end"],
+    ["`uvm_component_utils_begin", "`uvm_component_utils_end"],
+    ["`uvm_component_param_utils_begin", "`uvm_component_utils_end"],
+    ["`uvm_component_abstract_utils_begin", "`uvm_component_utils_end"],
+    ["`uvm_component_abstract_param_utils_begin", "`uvm_component_utils_end"],
+    ["`uvm_field_utils_begin", "`uvm_field_utils_end"],
+    ["`uvm_info_begin", "`uvm_info_end"],
+    ["`uvm_warning_begin", "`uvm_warning_end"],
+    ["`uvm_error_begin", "`uvm_error_end"],
+    ["`uvm_fatal_begin", "`uvm_fatal_end"],
+    ["`uvm_info_context_begin", "`uvm_info_context_end"],
+    ["`uvm_warning_context_begin", "`uvm_warning_context_end"],
+    ["`uvm_error_context_begin", "`uvm_error_context_end"],
+    ["`uvm_fatal_context_begin", "`uvm_fatal_context_end"],
+    ["`uvm_message_begin", "`uvm_message_end"],
+    ["`uvm_message_context_begin", "`uvm_message_context_end"]
+  ],
+  "colorizedBracketPairs": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"", "notIn": ["string", "comment"] },
+    { "open": "/*", "close": " */", "notIn": ["string"] }
+  ],
+  "surroundingPairs": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["\"", "\""]
+  ],
+  "indentationRules": {
+    "increaseIndentPattern": "^(?!\\s*//)(?!.*\\bend(?:module|interface|program|package|primitive|checker|config|generate|specify|table|group|property|sequence|class|function|task|clocking|case)\\b)(?:.*\\b(?:begin|fork)(?:\\s*:\\s*\\w+)?\\s*(?://.*)?$|\\s*(?:(?:unique0?|priority)\\s+)?(?:case|casex|casez|randcase)\\b|\\s*(?:(?:virtual|static|protected|local|automatic)\\s+)*(?:function|task)\\b|\\s*(?:(?:virtual|interface)\\s+)?class\\b|\\s*(?:module|macromodule|interface|program|package|primitive|checker|config|generate|specify|table|covergroup|property|sequence|randsequence)\\b|\\s*(?:(?:default|global)\\s+)?clocking\\b(?!\\s+\\w+\\s*;)|\\s*`uvm_\\w*_begin\\b)",
+    "decreaseIndentPattern": "^\\s*(?:end|join|join_any|join_none|endcase|endmodule|endinterface|endprogram|endpackage|endprimitive|endchecker|endconfig|endgenerate|endspecify|endtable|endgroup|endproperty|endsequence|endclass|endfunction|endtask|endclocking|`uvm_\\w*_end)\\b"
+  }
+}
