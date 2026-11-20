@@ -27,11 +27,13 @@
       {
         "id": "systemverilog",
         "extensions": [".sv", ".svh"],
+        "configuration": "./language-configuration.json",
         "aliases": ["SystemVerilog"]
       },
       {
         "id": "verilog",
         "extensions": [".v", ".vh"],
+        "configuration": "./language-configuration.json",
         "aliases": ["Verilog"]
       }
     ],
