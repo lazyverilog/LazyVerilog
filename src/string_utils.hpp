@@ -100,6 +100,70 @@ inline std::string json_quoted(std::string_view text) {
     return out;
 }
 
+/// Length of the well-formed UTF-8 sequence starting at `pos`, or 0 if the
+/// bytes there are not one (bad lead, truncated, overlong, surrogate, > U+10FFFF).
+inline size_t utf8_sequence_length(std::string_view text, size_t pos) {
+    const auto at = [&](size_t i) { return static_cast<unsigned char>(text[i]); };
+    const unsigned char c = at(pos);
+    if (c < 0x80)
+        return 1;
+    size_t len = 0;
+    unsigned char lo = 0x80, hi = 0xBF;  // allowed range of the second byte
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c == 0xE0) { len = 3; lo = 0xA0; }
+    else if (c == 0xED) { len = 3; hi = 0x9F; }
+    else if (c >= 0xE1 && c <= 0xEF) len = 3;
+    else if (c == 0xF0) { len = 4; lo = 0x90; }
+    else if (c == 0xF4) { len = 4; hi = 0x8F; }
+    else if (c >= 0xF1 && c <= 0xF3) len = 4;
+    else return 0;
+    if (pos + len > text.size() || at(pos + 1) < lo || at(pos + 1) > hi)
+        return 0;
+    for (size_t i = 2; i < len; ++i)
+        if ((at(pos + i) & 0xC0) != 0x80)
+            return 0;
+    return len;
+}
+
+inline bool is_valid_utf8(std::string_view text) {
+    for (size_t pos = 0; pos < text.size();) {
+        // Whole-word ASCII skip: messages are almost all ASCII.
+        uint64_t chunk;
+        if (pos + 8 <= text.size() &&
+            (std::memcpy(&chunk, text.data() + pos, sizeof(chunk)), !(chunk & 0x8080808080808080ULL))) {
+            pos += 8;
+            continue;
+        }
+        const size_t len = utf8_sequence_length(text, pos);
+        if (len == 0)
+            return false;
+        pos += len;
+    }
+    return true;
+}
+
+/// Replace each byte that is not part of well-formed UTF-8 with U+FFFD.  Only
+/// for display text (diagnostic messages, titles) that quotes raw source bytes:
+/// one bad byte makes the client drop the whole message.  Never for edit text,
+/// where a replacement would be written into the user's file.
+inline std::string valid_utf8(std::string text) {
+    if (is_valid_utf8(text))
+        return text;
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t len = utf8_sequence_length(text, pos);
+        if (len == 0) {
+            out += "\xEF\xBF\xBD";
+            ++pos;
+        } else {
+            out.append(text, pos, len);
+            pos += len;
+        }
+    }
+    return out;
+}
+
 /// Count the UTF-16 code units in a UTF-8 slice.
 ///
 /// LSP measures `Position.character` in UTF-16 code units, while every byte

@@ -688,3 +688,57 @@ TEST_CASE("a `line directive leaves includer macros and parse errors on their re
     REQUIRE_FALSE(bad->parse_diagnostics.empty());
     CHECK(bad->parse_diagnostics.front().line == 2);
 }
+
+TEST_CASE("doc sync: an unterminated include name keeps its last character", "[sync]") {
+    // slang stripped a closing quote that was not there, splitting the emoji:
+    // the "could not open" message was invalid UTF-8 JSON, and MinGW's
+    // std::filesystem::path threw on the name (found by the nightly fuzz).
+    Analyzer a;
+    const std::string text = "package p;\n  `include \"a\xF0\x9F\x98\x80\nendpackage\n";
+    a.open(kUri, text);
+    auto state = a.get_state(kUri);
+    REQUIRE(state != nullptr);
+    bool quoted_whole_name = false;
+    for (const auto& d : state->parse_diagnostics) {
+        INFO(d.message);
+        CHECK(is_valid_utf8(d.message));
+        if (d.message.find("'a\xF0\x9F\x98\x80'") != std::string::npos)
+            quoted_whole_name = true;
+    }
+    CHECK(quoted_whole_name);
+}
+
+TEST_CASE("doc sync: an unconvertible include name is reported, not thrown", "[sync]") {
+    // Windows' std::filesystem::path throws on a name that does not convert;
+    // slang's readHeader is patched to report it as an unopened include.
+    // Covers MinGW only: Linux and MSVC under CP1252 convert the name.
+    Analyzer a;
+    const std::string text = "package p;\n  `include \"caf\xE9.svh\"\n  `include \"b\nendpackage\n";
+    a.open(kUri, text);
+    auto state = a.get_state(kUri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    bool quoted_b = false;
+    for (const auto& d : state->parse_diagnostics) {
+        INFO(d.message);
+        CHECK(is_valid_utf8(d.message));
+        if (d.message.find("'b'") != std::string::npos)
+            quoted_b = true;  // a one-character unterminated name is still a name
+    }
+    CHECK(quoted_b);
+}
+
+TEST_CASE("doc sync: an unconvertible `line file name does not abort the parse", "[sync]") {
+    // The SV octal escape puts a lone 0xE9 into the name from valid UTF-8 text.
+    // MinGW's std::filesystem::path throws on it in slang's addLineDirective,
+    // which is patched to keep the line mapping under the file's own name.
+    // Covers MinGW only: Linux and MSVC under CP1252 convert the name.
+    Analyzer a;
+    const std::string text = "`line 100 \"caf\\351.sv\" 0\nmodule m; endmodule\n";
+    a.open(kUri, text);
+    auto state = a.get_state(kUri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    const auto loc = state->tree->root().getFirstToken().location();
+    CHECK(state->tree->sourceManager().getLineNumber(loc) == 100);
+}

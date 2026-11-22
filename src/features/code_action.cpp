@@ -1,5 +1,6 @@
 #include "code_action.hpp"
 #include "../lsp_position.hpp"
+#include "../string_utils.hpp"
 #include "../syntax_index.hpp"
 #include "autoarg.hpp"
 #include "autoff.hpp"
@@ -361,7 +362,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                 if (!seen_fixes.insert(std::move(key)).second)
                     continue;
                 CodeAction action;
-                action.title = fix.safe ? fix.title : fix.title + " (may change behavior)";
+                action.title = valid_utf8(fix.safe ? fix.title : fix.title + " (may change behavior)");
                 action.kind = optional<std::string>(std::string("quickfix"));
                 action.edit = optional<lsWorkspaceEdit>(we);
                 action.diagnostics = optional<std::vector<lsDiagnostic>>({diag});

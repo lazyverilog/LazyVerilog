@@ -31,7 +31,7 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
     ParseDiagInfo d;
     d.severity = sev;
     d.code     = std::string(lint_code_info(code).code);
-    d.message  = std::move(msg);
+    d.message  = valid_utf8(std::move(msg));  // quotes identifiers as written
     if (loc.valid()) {
         try {
             d.uri = uri_from_source_location(sm, loc);

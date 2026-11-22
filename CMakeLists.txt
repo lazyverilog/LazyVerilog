@@ -138,6 +138,60 @@ if(_file_line_done EQUAL -1)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Patch: an unterminated `include "name has no closing quote, but slang strips
+# one anyway.  The last byte of the name goes, which can split a UTF-8 sequence:
+# the "could not open" message is then undecodable JSON (found by the nightly
+# fuzz).  Strip the closing delimiter only when it is there, and size the
+# too-short check to match.
+# ──────────────────────────────────────────────────────────────────────────────
+file(READ "${slang_SOURCE_DIR}/source/parsing/Preprocessor.cpp" _pp_source)
+string(FIND "${_pp_source}" "lazyverilog patch: unterminated include" _pp_done)
+if(_pp_done EQUAL -1)
+    set(_pp_old_check "if (path.length() < 3) {")
+    set(_pp_old_strip "path = path.substr(1, path.length() - 2);")
+    string(FIND "${_pp_source}" "${_pp_old_check}" _pp_check_at)
+    string(FIND "${_pp_source}" "${_pp_old_strip}" _pp_strip_at)
+    if(_pp_check_at EQUAL -1 OR _pp_strip_at EQUAL -1)
+        message(FATAL_ERROR "Could not patch slang's include delimiter strip; re-derive the patch.")
+    endif()
+    string(REPLACE "${_pp_old_check}"
+           "// lazyverilog patch: unterminated include has no closing delimiter.\n    const size_t closingDelim = path.length() >= 2 && path.back() == (path[0] == '<' ? '>' : '\"') ? 1 : 0;\n    if (path.length() < 2 + closingDelim) {"
+           _pp_source "${_pp_source}")
+    string(REPLACE "${_pp_old_strip}"
+           "path = path.substr(1, path.length() - 1 - closingDelim);"
+           _pp_source "${_pp_source}")
+    file(WRITE "${slang_SOURCE_DIR}/source/parsing/Preprocessor.cpp" "${_pp_source}")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch: readHeader() builds a std::filesystem::path from the include name,
+# which throws on Windows when the name does not convert (malformed UTF-8 on
+# MinGW, a character outside the ANSI code page on MSVC).  Nothing above
+# catches it, so one bad `include aborted the whole parse.  Report the include
+# as not found instead.  addLineDirective() does the same with a `line file
+# name (an octal escape puts any byte there); keep its line mapping under the
+# file's own name.
+# ──────────────────────────────────────────────────────────────────────────────
+file(READ "${slang_SOURCE_DIR}/source/text/SourceManager.cpp" _sm_source)
+string(FIND "${_sm_source}" "lazyverilog patch: unconvertible include" _rh_done)
+if(_rh_done EQUAL -1)
+    set(_rh_old "    fs::path p = path;\n    if (p.is_absolute())")
+    set(_ld_old "    fs::path linePath = name;\n")
+    string(FIND "${_sm_source}" "${_rh_old}" _rh_at)
+    string(FIND "${_sm_source}" "${_ld_old}" _ld_at)
+    if(_rh_at EQUAL -1 OR _ld_at EQUAL -1)
+        message(FATAL_ERROR "Could not patch slang's SourceManager path conversions; re-derive the patch.")
+    endif()
+    string(REPLACE "${_rh_old}"
+           "    // lazyverilog patch: unconvertible include name is not found, not a throw.\n    fs::path p;\n    try {\n        p = path;\n    }\n    catch (const std::exception&) {\n        return nonstd::make_unexpected(make_error_code(std::errc::illegal_byte_sequence));\n    }\n    if (p.is_absolute())"
+           _sm_source "${_sm_source}")
+    string(REPLACE "${_ld_old}"
+           "    // lazyverilog patch: an unconvertible `line name keeps the file's own, not a throw.\n    fs::path linePath;\n    try {\n        linePath = name;\n    }\n    catch (const std::exception&) {\n        info->lineDirectives.emplace_back(std::string(info->data->name),\n                                          getRawLineNumber(fileLocation, lock), lineNum, level);\n        return;\n    }\n"
+           _sm_source "${_sm_source}")
+    file(WRITE "${slang_SOURCE_DIR}/source/text/SourceManager.cpp" "${_sm_source}")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(

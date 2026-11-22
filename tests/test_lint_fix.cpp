@@ -10,6 +10,7 @@
 #include "features/lint.hpp"
 #include "fix_apply.hpp"
 #include "lsp_position.hpp"
+#include "string_utils.hpp"
 
 #include <set>
 #include <string>
@@ -339,6 +340,17 @@ TEST_CASE("lint-fix: arith-op-mismatch widens the narrower operand", "[lint-fix]
                       "  assign c = a + b;\nendmodule\n";
     check_fix(src, "arith-op-mismatch", "assign c = a + 8'(b);");
     CHECK(title_of(src, "arith-op-mismatch") == "Cast b to 8 bits");
+}
+
+TEST_CASE("lint-fix: a long cast title is cut on a character boundary", "[lint-fix]") {
+    // 36 bytes of operand text, then a 2-byte character across the 37-byte cut.
+    const std::string src = "module m(input logic [7:0] a, input logic [3:0] b, output logic [7:0] c);\n"
+                            "  assign c = a + {b /* " + std::string(30, 'x') +
+                            "\xC3\xA9 tail */};\nendmodule\n";
+    const auto title = title_of(src, "arith-op-mismatch");
+    INFO(title);
+    CHECK(is_valid_utf8(title));
+    CHECK(title.find("xxx...") != std::string::npos);
 }
 
 TEST_CASE("lint-fix: bitwise-op-mismatch widens the narrower operand", "[lint-fix]") {

@@ -65,8 +65,15 @@ std::string title_text(const SourceManager& sm, SourceRange range) {
     }
     if (!out.empty() && out.back() == ' ')
         out.pop_back();
-    if (out.size() > 40)
-        out = out.substr(0, 37) + "...";
+    if (out.size() > 40) {
+        // Don't split a UTF-8 character: back up over at most 3 continuation bytes.
+        size_t cut = 37;
+        while (cut > 34 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+            --cut;
+        if ((static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+            cut = 37;  // not UTF-8 here; cut where it was
+        out = out.substr(0, cut) + "...";
+    }
     return out;
 }
 

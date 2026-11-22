@@ -544,20 +544,6 @@ TEST_CASE("documentSymbol: a generate-block declaration is reported once",
     CHECK(sig->detail->find("logic") != std::string::npos);
 }
 
-static bool is_valid_utf8(const std::string& s) {
-    for (size_t i = 0; i < s.size();) {
-        const auto c = static_cast<unsigned char>(s[i]);
-        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
-        if (len == 0 || i + len > s.size())
-            return false;
-        for (size_t k = 1; k < len; ++k)
-            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
-                return false;
-        i += len;
-    }
-    return true;
-}
-
 // Found by tools/lsp_fuzz.py: a non-ASCII character typed into a packed
 // dimension came back cut in half, and the client could not decode the response.
 TEST_CASE("documentSymbol: a non-ASCII character in a port type stays whole",

@@ -52,3 +52,15 @@ TEST_CASE("json string: append_json_string adds to what is already there", "[jso
     out += "}";
     CHECK(out == "{\"k\":\"v\"}");
 }
+
+TEST_CASE("valid_utf8 replaces only malformed bytes", "[json]") {
+    CHECK(valid_utf8("a\xF0\x9F\x98\x80z") == "a\xF0\x9F\x98\x80z");
+    CHECK(valid_utf8("a\xF0\x9F\x98") == "a\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(valid_utf8("\xE9t\xE9") == "\xEF\xBF\xBDt\xEF\xBF\xBD");
+    CHECK(valid_utf8("\xED\xA0\x80") == "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");  // surrogate
+    CHECK(valid_utf8("\xC0\xAF") == "\xEF\xBF\xBD\xEF\xBF\xBD");                  // overlong
+    CHECK_FALSE(is_valid_utf8("\xF4\x90\x80\x80"));                              // > U+10FFFF
+    // The ASCII fast path must still see a bad byte after eight clean ones.
+    CHECK_FALSE(is_valid_utf8("abcdefgh\xE9"));
+    CHECK(is_valid_utf8("abcdefgh\xC3\xA9xyz"));
+}

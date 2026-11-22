@@ -72,7 +72,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
         info.severity = 3;
 
     try {
-        info.message = engine.formatMessage(diagnostic);
+        info.message = valid_utf8(engine.formatMessage(diagnostic));
     } catch (...) {
         info.message = "(semantic diagnostic format error)";
     }

@@ -152,7 +152,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
         else
             info.severity = 3;
         try {
-            info.message = engine.formatMessage(d);
+            info.message = valid_utf8(engine.formatMessage(d));
         } catch (...) {
             info.message = "(diagnostic format error)";
         }
@@ -243,8 +243,9 @@ static std::string header_directives_only(std::string_view text);
 /// written with angle brackets.
 ///
 /// The diagnostic's own argument cannot answer this.  slang strips the
-/// delimiters before it formats the message -- `path = path.substr(1, len - 2)`
-/// in Preprocessor::handleIncludeDirective -- so an unresolved
+/// delimiters before it formats the message (Preprocessor::
+/// handleIncludeDirective, patched in CMakeLists.txt to keep the last character
+/// of an unterminated name) -- so an unresolved
 /// `` `include <x.svh> `` and `` `include "x.svh" `` both arrive here spelled
 /// `x.svh`, and a first-character test on that string is false for every
 /// include there is.
@@ -1270,9 +1271,16 @@ static bool macros_where_included(const std::string& header_path, const std::str
         if (open == std::string_view::npos || (text[open] != '"' && text[open] != '<'))
             continue;
         const auto close = text.find_first_of(text[open] == '"' ? "\"\n" : ">\n", open + 1);
+        // An unterminated name is skipped although slang (patched) opens it:
+        // it exists only while the closing quote is being typed.
         if (close == std::string_view::npos || text[close] == '\n')
             continue;
-        const fs::path spelled(text.substr(open + 1, close - open - 1));
+        fs::path spelled;
+        try {
+            spelled = fs::path(text.substr(open + 1, close - open - 1));
+        } catch (const std::exception&) {
+            continue;  // Windows: a name that does not convert names no file
+        }
         const bool direct = spelled.filename() == header_name;
         if (!direct && depth == 0)
             continue;
@@ -9141,7 +9149,13 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::unordered_map<std::string, std::string> local_resolution;
 
     const auto resolve_include = [&](const IncludeResolution& recorded) -> std::string {
-        const std::filesystem::path spelling(recorded.spelling);
+        // Windows throws on a spelling that does not convert; it names no file.
+        std::filesystem::path spelling;
+        try {
+            spelling = recorded.spelling;
+        } catch (const std::exception&) {
+            return {};
+        }
         if (spelling.is_absolute())
             return resolved_uri_if_file(spelling);
         // System includes search system directories only, and the parse path
