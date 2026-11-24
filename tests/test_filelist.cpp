@@ -292,3 +292,385 @@ TEST_CASE("filelist: every filelist read is reported, -f chain included", "[file
     CHECK(std::find(result.filelists.begin(), result.filelists.end(),
                     norm(root / "lists" / "child.vc")) != result.filelists.end());
 }
+
+TEST_CASE("filelist: * and ? expand to matching source files, sorted", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_star");
+    write_text(root / "rtl/b.sv", "");
+    write_text(root / "rtl/a.sv", "");
+    write_text(root / "rtl/c.v", "");
+    write_text(root / "rtl/ab.sv", "");
+    write_text(root / "rtl/.hidden.sv", "");
+    fs::create_directories(root / "rtl/dir.sv"); // a directory is not a source
+    write_text(root / "top.vc",
+               "rtl/*.sv\n"
+               "rtl/?.v\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 4);
+    CHECK(result.files[0] == norm(root / "rtl/a.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/ab.sv"));
+    CHECK(result.files[2] == norm(root / "rtl/b.sv"));
+    CHECK(result.files[3] == norm(root / "rtl/c.v"));
+    REQUIRE(result.file_sizes.size() == result.files.size());
+}
+
+TEST_CASE("filelist: ** matches zero or more directories", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_globstar");
+    write_text(root / "rtl/top.sv", "");
+    write_text(root / "rtl/core/alu.sv", "");
+    write_text(root / "rtl/core/deep/mul.sv", "");
+    write_text(root / "rtl/core/deep/notes.txt", "");
+    write_text(root / "rtl/.git/skip.sv", "");
+    write_text(root / "top.vc", "rtl/**/*.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 3);
+    CHECK(result.files[0] == norm(root / "rtl/core/alu.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/core/deep/mul.sv"));
+    CHECK(result.files[2] == norm(root / "rtl/top.sv"));
+}
+
+TEST_CASE("filelist: a trailing ** names every file below it", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_trailing");
+    write_text(root / "lib/a.sv", "");
+    write_text(root / "lib/sub/b.sv", "");
+    write_text(root / "top.vc", "-v lib/**\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "lib/a.sv"));
+    CHECK(result.files[1] == norm(root / "lib/sub/b.sv"));
+}
+
+TEST_CASE("filelist: source globs keep only Verilog and SystemVerilog files",
+          "[filelist][glob]") {
+    // The examples of #212: `rtl/*` and `rtl/**` name the design's sources,
+    // not every file beside them.  Headers are reached through `include.
+    const auto root = make_temp_dir("lv_filelist_glob_sources");
+    write_text(root / "rtl/top.sv", "");
+    write_text(root / "rtl/legacy.v", "");
+    write_text(root / "rtl/defs.svh", "");
+    write_text(root / "rtl/README.md", "");
+    write_text(root / "rtl/sub/counter.sv", "");
+    write_text(root / "rtl/sub/notes.txt", "");
+    write_text(root / "rtl/sub/files.f", "");
+    write_text(root / "star.vc", "rtl/*\n");
+    write_text(root / "globstar.vc", "-v rtl/**\n");
+    write_text(root / "explicit.vc", "rtl/*.md\n");
+
+    Config cfg;
+    cfg.design.vcode = "star.vc";
+    auto result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "rtl/legacy.v"));
+    CHECK(result.files[1] == norm(root / "rtl/top.sv"));
+
+    cfg.design.vcode = "globstar.vc";
+    result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 3);
+    CHECK(result.files[0] == norm(root / "rtl/legacy.v"));
+    CHECK(result.files[1] == norm(root / "rtl/sub/counter.sv"));
+    CHECK(result.files[2] == norm(root / "rtl/top.sv"));
+
+    // Even when asked for by name: a glob never makes a non-source a source.
+    // A plain entry still names any file, as before.
+    cfg.design.vcode = "explicit.vc";
+    result = load_vcode(root, cfg);
+    CHECK(result.files.empty());
+}
+
+TEST_CASE("filelist: bracket sets, ranges and negation", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_bracket");
+    for (const char* name : {"u0.sv", "u1.sv", "u2.sv", "ua.sv", "u].sv"})
+        write_text(root / "rtl" / name, "");
+    write_text(root / "range.vc", "rtl/u[0-1].sv\n");
+    write_text(root / "neg.vc", "rtl/u[!0-1].sv\n");
+    write_text(root / "bracket.vc", "rtl/u[]a].sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "range.vc";
+    auto result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "rtl/u0.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/u1.sv"));
+
+    cfg.design.vcode = "neg.vc";
+    result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 3);
+    CHECK(result.files[0] == norm(root / "rtl/u2.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/u].sv"));
+    CHECK(result.files[2] == norm(root / "rtl/ua.sv"));
+
+    // A `]` first in the set is a member, not the end of it.
+    cfg.design.vcode = "bracket.vc";
+    result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "rtl/u].sv"));
+    CHECK(result.files[1] == norm(root / "rtl/ua.sv"));
+}
+
+TEST_CASE("filelist: a glob in a middle segment", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_middle");
+    write_text(root / "ip/uart/rtl/top.sv", "");
+    write_text(root / "ip/spi/rtl/top.sv", "");
+    write_text(root / "ip/gpio/other/top.sv", "");
+    write_text(root / "top.vc", "ip/*/rtl/top.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "ip/spi/rtl/top.sv"));
+    CHECK(result.files[1] == norm(root / "ip/uart/rtl/top.sv"));
+}
+
+TEST_CASE("filelist: +incdir+ globs match directories only", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_incdir");
+    fs::create_directories(root / "ip/uart/include");
+    fs::create_directories(root / "ip/spi/include");
+    write_text(root / "ip/gpio/include", ""); // a file, not a directory
+    fs::create_directories(root / "common");
+    write_text(root / "top.vc", "+incdir+ip/*/include+comm?n\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    CHECK(result.files.empty());
+    REQUIRE(result.include_dirs.size() == 3);
+    CHECK(result.include_dirs[0] == norm(root / "ip/spi/include"));
+    CHECK(result.include_dirs[1] == norm(root / "ip/uart/include"));
+    CHECK(result.include_dirs[2] == norm(root / "common"));
+}
+
+TEST_CASE("filelist: -f globs load every matching filelist", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_nested");
+    write_text(root / "blocks/b/files.f", "b.sv\n");
+    write_text(root / "blocks/a/files.f", "a.sv\n");
+    write_text(root / "more/x.f", "x.sv\n");
+    write_text(root / "top.vc",
+               "-f blocks/*/files.f\n"
+               "-f=more/*.f\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 3);
+    CHECK(result.files[0] == norm(root / "blocks/a/a.sv"));
+    CHECK(result.files[1] == norm(root / "blocks/b/b.sv"));
+    CHECK(result.files[2] == norm(root / "more/x.sv"));
+    // Each expanded filelist is reported, so a watcher event on it reloads.
+    CHECK(result.filelists.size() == 4);
+    CHECK(std::find(result.filelists.begin(), result.filelists.end(),
+                    norm(root / "blocks/a/files.f")) != result.filelists.end());
+}
+
+TEST_CASE("filelist: a glob matching nothing contributes nothing", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_empty");
+    write_text(root / "top.sv", "");
+    write_text(root / "top.vc",
+               "missing/*.sv\n"
+               "nowhere/**/*.sv\n"
+               "+incdir+none/*\n"
+               "-f lists/*.f\n"
+               "top.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "top.sv"));
+    CHECK(result.include_dirs.empty());
+    CHECK(result.filelists.size() == 1);
+}
+
+TEST_CASE("filelist: glob matches and explicit entries are deduplicated", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_dedup");
+    write_text(root / "rtl/pkg.sv", "");
+    write_text(root / "rtl/top.sv", "");
+    write_text(root / "top.vc",
+               "rtl/pkg.sv\n"
+               "rtl/*.sv\n"
+               "rtl/**/**/*.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "rtl/pkg.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/top.sv"));
+}
+
+TEST_CASE("filelist: a file literally named like a pattern is used when nothing matches",
+          "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_literal");
+    write_text(root / "rtl/top[0].sv", "");
+    write_text(root / "top.vc", "rtl/top[0].sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "rtl/top[0].sv"));
+}
+
+TEST_CASE("filelist: globs combine with environment variables", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_env");
+    const auto ext = root / "ext";
+#ifdef _WIN32
+    _putenv_s("LV_FILELIST_GLOB_DIR", ext.string().c_str());
+#else
+    setenv("LV_FILELIST_GLOB_DIR", ext.c_str(), 1);
+#endif
+    write_text(ext / "one.sv", "");
+    write_text(ext / "two.sv", "");
+    write_text(root / "top.vc", "${LV_FILELIST_GLOB_DIR}/*.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(ext / "one.sv"));
+    CHECK(result.files[1] == norm(ext / "two.sv"));
+}
+
+TEST_CASE("filelist: wildcard characters in the filelist's own directory are literal",
+          "[filelist][glob]") {
+    // Only the entry as written is a pattern.  A checkout under `proj[v2]`
+    // must neither turn plain entries into patterns (losing the missing-file
+    // entry) nor make `rtl/*.sv` look for `projv` or `proj2`.
+    const auto root = make_temp_dir("lv_filelist_glob_[v2]");
+    write_text(root / "rtl/a.sv", "");
+    write_text(root / "rtl/b.sv", "");
+    write_text(root / "top.vc",
+               "rtl/*.sv\n"
+               "rtl/missing.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 3);
+    CHECK(result.files[0] == norm(root / "rtl/a.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/b.sv"));
+    // A plain entry is recorded even when missing, as before wildcards.
+    CHECK(result.files[2] == norm(root / "rtl/missing.sv"));
+}
+
+TEST_CASE("filelist: .. after a wildcard needs the wildcard to match first",
+          "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_dotdot");
+    write_text(root / "ip/shared.sv", "");
+    write_text(root / "top.vc", "ip/*/../shared.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    auto result = load_vcode(root, cfg);
+    CHECK(result.files.empty()); // no directory under ip/ yet
+
+    fs::create_directories(root / "ip/uart");
+    result = load_vcode(root, cfg);
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "ip/shared.sv"));
+}
+
+TEST_CASE("filelist: a glob ending in a separator matches directories only",
+          "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_trailing_sep");
+    write_text(root / "ip/a.sv", "");
+    fs::create_directories(root / "ip/uart");
+    write_text(root / "top.vc",
+               "ip/*/\n"
+               "+incdir+ip/*/\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    CHECK(result.files.empty());
+    REQUIRE(result.include_dirs.size() == 1);
+    CHECK(result.include_dirs[0] == norm(root / "ip/uart"));
+}
+
+TEST_CASE("filelist: non-ASCII names under a glob do not abort the filelist",
+          "[filelist][glob]") {
+    // On Windows a name outside the narrow code page cannot be spelled as a
+    // std::string; meeting one during a walk must not lose the rest.
+    const auto root = make_temp_dir("lv_filelist_glob_unicode");
+    const auto unicode_dir = root / "rtl" / fs::path(u8"\uD55C\uAE00");
+    fs::create_directories(unicode_dir);
+    { std::ofstream(unicode_dir / fs::path(u8"\uBAA8\uB4C8.sv")); }
+    write_text(root / "rtl/top.sv", "");
+    write_text(root / "top.vc",
+               "rtl/**/*.sv\n"
+               "after.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    VcodeResult result;
+    REQUIRE_NOTHROW(result = load_vcode(root, cfg));
+
+    CHECK(std::find(result.files.begin(), result.files.end(), norm(root / "rtl/top.sv")) !=
+          result.files.end());
+    CHECK(std::find(result.files.begin(), result.files.end(), norm(root / "after.sv")) !=
+          result.files.end());
+}
+
+TEST_CASE("filelist: ** through a link back to an ancestor ends and does not duplicate",
+          "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_loop");
+    write_text(root / "rtl/top.sv", "");
+    write_text(root / "rtl/sub/alu.sv", "");
+    std::error_code ec;
+    fs::create_directory_symlink(root / "rtl", root / "rtl/sub/loop", ec);
+#ifdef _WIN32
+    // A symlink needs a privilege a junction does not, and a junction is the
+    // link some runtimes report as a plain directory.
+    if (ec) {
+        const auto command = "mklink /J \"" + (root / "rtl" / "sub" / "loop").string() + "\" \"" +
+                             (root / "rtl").string() + "\" >NUL";
+        if (std::system(command.c_str()) == 0 && fs::exists(root / "rtl/sub/loop/top.sv"))
+            ec.clear();
+    }
+#endif
+    if (ec)
+        SKIP("cannot create a directory link here: " << ec.message());
+    write_text(root / "top.vc", "rtl/**/*.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "rtl/sub/alu.sv"));
+    CHECK(result.files[1] == norm(root / "rtl/top.sv"));
+}
+
+#ifdef _WIN32
+TEST_CASE("filelist: Windows globs ignore case, as the filesystem does", "[filelist][glob]") {
+    const auto root = make_temp_dir("lv_filelist_glob_case");
+    write_text(root / "RTL/Top.SV", "");
+    write_text(root / "top.vc", "rtl/*.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+}
+#endif
