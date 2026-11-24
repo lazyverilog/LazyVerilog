@@ -53,6 +53,30 @@ continues on the next line. Quote a path that contains spaces (`"my dir/top.sv"`
 in filelists and in `vcode`. The editor must start with the variable set. A variable that is not set
 is left as written.
 
+**Wildcards.** Source paths, `-v`, `-f` and `+incdir+` entries may use shell-style wildcards,
+expanded when the filelist is read:
+
+```text
+rtl/*.sv                  # every .sv in rtl/
+rtl/**/*.sv               # ... and in every directory below it
+ip/*/rtl/top_?.sv         # * and ? match within one path segment
+rtl/u[0-3].sv             # [abc], [a-z], [!a-z]
+-f blocks/*/files.f       # every matching nested filelist
++incdir+ip/*/include      # every matching directory
+```
+
+`**` matches zero or more directories. Matches are sorted by path. A wildcard source or `-v` entry
+keeps only `.sv` and `.v` files, so `rtl/*` and `rtl/**` skip READMEs and headers (headers are
+reached through `` `include ``); `-f` and `+incdir+` patterns are not filtered. A wildcard does not match a
+leading `.` unless the pattern starts with one, and `**` skips hidden directories, does not follow
+directory symlinks or junctions, and never walks one directory twice. On Windows matching ignores case. A pattern that matches nothing adds nothing, without a
+warning. Only the entry as written is a pattern: the filelist's own directory, and environment
+variables in the path segments before the first wildcard, are taken literally. A pattern ending in
+`/` matches directories only. If a pattern matches nothing but a file is literally named that way
+(`top[0].sv`), that file is used. Matches are found when the filelist
+is loaded; a file created later is picked up when a `.f`/`.vf` filelist of the project or
+`lazyverilog.toml` changes on disk.
+
 **UVM library.** List the package file and put the headers on an include path. `uvm_pkg.sv` is
 indexed, and its `` `include `` lines resolve through the include directory, so you do not list every
 `.svh`.
