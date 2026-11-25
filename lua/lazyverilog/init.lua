@@ -30,6 +30,7 @@ local _rtltree = {
 	hl_ns      = nil, -- highlight namespace
 	jumping    = false, -- guard: suppress BufEnter sync during jump
 	command    = nil, -- last command used ("lazyverilog.rtlTree" or …Reverse)
+	align      = nil, -- per-command align override (nil = setup() default)
 }
 
 -- Forward declaration so M.setup() can reference it before the definition below.
@@ -336,14 +337,25 @@ function M.setup(user_config)
 		end
 	end, { nargs = "*" })
 
-	-- Register :RtlTree / :RtlTreeReverse user commands.
-	vim.api.nvim_create_user_command("RtlTree", function()
-		M.rtltree()
-	end, { nargs = 0 })
-
-	vim.api.nvim_create_user_command("RtlTreeReverse", function()
-		M.rtltreereverse()
-	end, { nargs = 0 })
+	-- Register :RtlTree / :RtlTreeReverse [align|noalign] user commands.  The
+	-- optional argument overrides `rtltree.align` from setup() for this tree.
+	local function rtltree_command(name, fn)
+		vim.api.nvim_create_user_command(name, function(opts)
+			local arg = vim.trim(opts.args)
+			if arg == "" then
+				fn()
+			elseif arg == "align" or arg == "noalign" then
+				fn({ align = arg == "align" })
+			else
+				vim.notify("[LazyVerilog] Usage: :" .. name .. " [align|noalign]", vim.log.levels.ERROR)
+			end
+		end, {
+			nargs    = "?",
+			complete = function() return { "align", "noalign" } end,
+		})
+	end
+	rtltree_command("RtlTree", M.rtltree)
+	rtltree_command("RtlTreeReverse", M.rtltreereverse)
 
 	-- Register :Lint user command.
 	vim.api.nvim_create_user_command("Lint", function()
@@ -434,30 +446,89 @@ end
 -- RtlTree helpers
 -- ---------------------------------------------------------------------------
 
--- Render one tree node (recursive). Appends to `lines` and `line_data`.
-local function _rtltree_render(node, lines, line_data, prefix, is_last, depth, opts)
-	local label = node.name
-	if opts.show_instance_name and node.inst and node.inst ~= node.name then
-		label = label .. " (" .. node.inst .. ")"
+-- Highlight groups for the parts of a tree row.  `default = true` keeps any
+-- user override; linking a group to `Normal` renders that part as plain text.
+-- Called on every render so a `:colorscheme` (which clears links) recovers.
+local function _rtltree_define_hl()
+	local links = {
+		LazyVerilogRtlTreeTitle    = "Title",
+		LazyVerilogKeyGuide        = "Comment",
+		LazyVerilogRtlTreeModule   = "Type",
+		LazyVerilogRtlTreeInstance = "Identifier",
+		LazyVerilogRtlTreeFile     = "Comment",
+		LazyVerilogRtlTreeGuide    = "NonText",
+		LazyVerilogRtlTreeMarker   = "WarningMsg",
+	}
+	for group, target in pairs(links) do
+		pcall(vim.api.nvim_set_hl, 0, group, { link = target, default = true })
+	end
+end
+
+local _rtltree_path_modes = { cwd = true, project = true, tail = true, absolute = true }
+local _rtltree_warned_path_mode = false
+
+-- Resolve `setup({ rtltree = { path } })`; unknown values warn once, use "cwd".
+local function _rtltree_path_mode()
+	local mode = _cfg and _cfg.rtltree and _cfg.rtltree.path
+	if mode == nil then return "cwd" end
+	if _rtltree_path_modes[mode] then return mode end
+	if not _rtltree_warned_path_mode then
+		_rtltree_warned_path_mode = true
+		vim.notify("[LazyVerilog] rtltree.path must be \"cwd\", \"project\", \"tail\" or "
+			.. "\"absolute\"; got " .. vim.inspect(mode) .. ", using \"cwd\"", vim.log.levels.WARN)
+	end
+	return "cwd"
+end
+
+-- Display form of a node's file (the server sends absolute file:// URIs).
+-- `cache` memoizes the "project" root lookup per directory for one render.
+local function _rtltree_display_path(file, mode, cache)
+	local path = file
+	if path:match("^file://") then
+		path = vim.uri_to_fname(path)
+	end
+	if mode == "absolute" then
+		return path
+	elseif mode == "tail" then
+		return vim.fn.fnamemodify(path, ":t")
+	elseif mode == "project" then
+		local dir = vim.fs.dirname(path)
+		local root = cache[dir]
+		if root == nil then
+			root = vim.fs.root(path, "lazyverilog.toml") or false
+			cache[dir] = root
+		end
+		if root then
+			local norm_root = vim.fs.normalize(root)
+			local norm_path = vim.fs.normalize(path)
+			if norm_path:sub(1, #norm_root + 1) == norm_root .. "/" then
+				return norm_path:sub(#norm_root + 2)
+			end
+		end
+		return path
+	end
+	return vim.fn.fnamemodify(path, ":~:.")
+end
+
+-- Collect one tree node (recursive) as a row record of separate parts.
+-- Appends to `rows` and `line_data`; `_rtltree_layout` turns rows into text.
+local function _rtltree_render(node, rows, line_data, prefix, is_last, depth, opts)
+	local row = { guide = "", name = node.name or "", inst = "", file = "", marker = "" }
+	if opts.show_instance_name and node.inst and node.inst ~= "" and node.inst ~= node.name then
+		row.inst = "(" .. node.inst .. ")"
 	end
 	if opts.show_file and node.file and node.file ~= "" then
-		local path = node.file:gsub("^file://", "")
-		label = label .. "  [" .. path .. "]"
+		row.file = "[" .. _rtltree_display_path(node.file, opts.path_mode, opts.path_cache) .. "]"
 	end
 	if node.recursive then
-		label = label .. "  <recursive>"
+		row.marker = "<recursive>"
 	elseif node.unknown then
-		label = label .. "  <unknown>"
+		row.marker = "<unknown>"
 	end
-
-	local line
-	if depth == 0 then
-		line = label
-	else
-		local connector = is_last and "└─ " or "├─ "
-		line = prefix .. connector .. label
+	if depth > 0 then
+		row.guide = prefix .. (is_last and "└─ " or "├─ ")
 	end
-	table.insert(lines, line)
+	table.insert(rows, row)
 	table.insert(line_data, {
 		name  = node.name,
 		file  = node.file,
@@ -476,8 +547,67 @@ local function _rtltree_render(node, lines, line_data, prefix, is_last, depth, o
 		else
 			child_prefix = prefix .. (is_last and "   " or "│  ")
 		end
-		_rtltree_render(child, lines, line_data, child_prefix, child_is_last, depth + 1, opts)
+		_rtltree_render(child, rows, line_data, child_prefix, child_is_last, depth + 1, opts)
 	end
+end
+
+-- Turn row records into text lines plus highlight spans.  Span columns are
+-- byte offsets (extmark columns); alignment pads by display width, since the
+-- tree guides are multibyte.  Unaligned output matches the historical layout.
+local function _rtltree_layout(rows, align)
+	local w_name, w_inst = 0, 0
+	if align then
+		for _, r in ipairs(rows) do
+			w_name = math.max(w_name, vim.fn.strdisplaywidth(r.guide .. r.name))
+			w_inst = math.max(w_inst, vim.fn.strdisplaywidth(r.inst))
+		end
+	end
+	local any_inst = w_inst > 0
+
+	local lines, spans = {}, {}
+	for _, r in ipairs(rows) do
+		local parts, hl = {}, {}
+		local len = 0
+		local function put(text, group)
+			if text == "" then return end
+			if group then table.insert(hl, { group, len, len + #text }) end
+			table.insert(parts, text)
+			len = len + #text
+		end
+		local function pad(n)
+			if n > 0 then put(string.rep(" ", n)) end
+		end
+
+		put(r.guide, "LazyVerilogRtlTreeGuide")
+		put(r.name, "LazyVerilogRtlTreeModule")
+		local has_tail = r.inst ~= "" or r.file ~= "" or r.marker ~= ""
+		if align then
+			if has_tail then
+				pad(w_name - vim.fn.strdisplaywidth(r.guide .. r.name))
+				if any_inst then
+					put(" ")
+					put(r.inst, "LazyVerilogRtlTreeInstance")
+					if r.file ~= "" or r.marker ~= "" then
+						pad(w_inst - vim.fn.strdisplaywidth(r.inst))
+					end
+				end
+			end
+		elseif r.inst ~= "" then
+			put(" ")
+			put(r.inst, "LazyVerilogRtlTreeInstance")
+		end
+		if r.file ~= "" then
+			put("  ")
+			put(r.file, "LazyVerilogRtlTreeFile")
+		end
+		if r.marker ~= "" then
+			put("  ")
+			put(r.marker, "LazyVerilogRtlTreeMarker")
+		end
+		table.insert(lines, table.concat(parts))
+		table.insert(spans, hl)
+	end
+	return lines, spans
 end
 
 local function _rtltree_stats(node, depth)
@@ -545,7 +675,7 @@ local function _rtltree_jump(split_cmd)
 	_rtltree.jumping = false
 end
 
-local function _rtltree_build_buf(lines, line_data)
+local function _rtltree_build_buf(lines, spans)
 	local buf = vim.api.nvim_create_buf(false, true)
 	pcall(vim.api.nvim_buf_set_name, buf, "RtlTree")
 
@@ -557,11 +687,20 @@ local function _rtltree_build_buf(lines, line_data)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.api.nvim_buf_set_option(buf, "modifiable", false)
 	vim.api.nvim_buf_set_option(buf, "readonly", true)
-	pcall(vim.api.nvim_set_hl, 0, "LazyVerilogRtlTreeTitle", { link = "Title", default = true })
-	pcall(vim.api.nvim_set_hl, 0, "LazyVerilogKeyGuide", { link = "Comment", default = true })
+	_rtltree_define_hl()
+	-- Static per-render highlights.  Kept apart from `_rtltree.hl_ns`, which
+	-- `_rtltree_sync` clears on every BufEnter.
 	local ns = vim.api.nvim_create_namespace("LazyVerilogRtlTreeGuide")
 	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogRtlTreeTitle", 0, 0, -1)
 	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogKeyGuide", 1, 0, -1)
+	for row, row_spans in pairs(spans) do
+		for _, s in ipairs(row_spans) do
+			vim.api.nvim_buf_set_extmark(buf, ns, row - 1, s[2], {
+				end_col  = s[3],
+				hl_group = s[1],
+			})
+		end
+	end
 
 	local function map(key, fn)
 		vim.keymap.set("n", key, fn, { noremap = true, silent = true, buffer = buf })
@@ -594,6 +733,14 @@ local function _rtltree_show(tree, source_buf)
 		end
 	end
 
+	opts.path_mode  = _rtltree_path_mode()
+	opts.path_cache = {}
+
+	local align = _rtltree.align
+	if align == nil then
+		align = (_cfg and _cfg.rtltree and _cfg.rtltree.align) == true
+	end
+
 	local instance_rows, max_depth = _rtltree_stats(tree, 0)
 	local lines     = {
 		string.format("RtlTree (Depth: %d / Instance: %d)", max_depth + 1, instance_rows),
@@ -605,7 +752,14 @@ local function _rtltree_show(tree, source_buf)
 		{ guide = true },
 		{ guide = true },
 	}
-	_rtltree_render(tree, lines, line_data, "", true, 0, opts)
+	local rows = {}
+	_rtltree_render(tree, rows, line_data, "", true, 0, opts)
+	local tree_lines, tree_spans = _rtltree_layout(rows, align)
+	local spans = {}
+	for i, l in ipairs(tree_lines) do
+		table.insert(lines, l)
+		spans[#lines] = tree_spans[i]
+	end
 
 	-- Find existing tree window
 	local tree_win = nil
@@ -625,7 +779,7 @@ local function _rtltree_show(tree, source_buf)
 		vim.api.nvim_set_current_win(source_win)
 	end
 
-	local buf           = _rtltree_build_buf(lines, line_data)
+	local buf           = _rtltree_build_buf(lines, spans)
 
 	_rtltree.bufnr      = buf
 	_rtltree.source_buf = source_buf
@@ -729,15 +883,22 @@ end
 -- Public RtlTree API
 -- ---------------------------------------------------------------------------
 
-function M.rtltree()
+--- Open the module hierarchy for the current buffer.
+---@param opts? { align?: boolean }  `align` overrides `setup({ rtltree = { align } })`
+---  for this tree (kept across `r` refreshes); nil uses the config default.
+function M.rtltree(opts)
 	local cmd = "lazyverilog.rtlTree"
 	_rtltree.command = cmd
+	_rtltree.align = opts and opts.align
 	_rtltree_request(vim.api.nvim_get_current_buf(), cmd, 3)
 end
 
-function M.rtltreereverse()
+--- Open the reverse hierarchy (where the current module is instantiated).
+---@param opts? { align?: boolean }  see M.rtltree()
+function M.rtltreereverse(opts)
 	local cmd = "lazyverilog.rtlTreeReverse"
 	_rtltree.command = cmd
+	_rtltree.align = opts and opts.align
 	_rtltree_request(vim.api.nvim_get_current_buf(), cmd, 3)
 end
 
