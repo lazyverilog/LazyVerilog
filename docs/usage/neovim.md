@@ -32,8 +32,8 @@ some lint diagnostics. Outside a class, it also offers `Insert always_ff block` 
 | `:Format` | Format the buffer or visual range |
 | `:Lint` | Show diagnostics for the buffer |
 | `:LintAll` | Show diagnostics for all indexed project files |
-| `:RtlTree` | Open the [module hierarchy](../rtl-tree/index.md) |
-| `:RtlTreeReverse` | Open the reverse hierarchy from the current module |
+| `:RtlTree [align\|noalign]` | Open the [module hierarchy](../rtl-tree/index.md) |
+| `:RtlTreeReverse [align\|noalign]` | Open the reverse hierarchy from the current module |
 | `:Interface <inst>` | Inspect one instance ([Interface](../interface.md)) |
 | `:Interface <inst1> <inst2>` | Inspect and edit connections between two instances |
 | `:Connect <module1> <module2>` | Connect two modules through the hierarchy ([Connect](../connect.md)) |

@@ -49,6 +49,17 @@ M.defaults = {
 	-- computation out of the edit loop entirely.
 	folding = true,
 
+	-- :RtlTree / :RtlTreeReverse window.
+	--
+	-- `align` pads the module and instance columns so `(u_inst)` and
+	-- `[file]` line up across rows.  `:RtlTree align` / `:RtlTree noalign`
+	-- override it for one tree.  `show_instance_name` / `show_file` are
+	-- deliberately absent: left nil, they come from `[rtltree]` in
+	-- lazyverilog.toml; set here, they override every project.
+	rtltree = {
+		align = false,
+	},
+
 	-- nvim-lspconfig / vim.lsp.start options forwarded verbatim.
 	on_attach = nil,
 	capabilities = nil,
