@@ -83,6 +83,27 @@ local function check_rtltree(dir)
 		return "RtlTree: unaligned layout unexpectedly aligned: " .. vim.inspect(rows)
 	end
 
+	-- rtltree.path: how `[file]` is shown.  The server sends absolute URIs.
+	local cfg = require("lazyverilog").get_config()
+	local orig_cwd = vim.fn.getcwd()
+	local function file_span(mode, cwd)
+		cfg.rtltree.path = mode
+		vim.cmd("cd " .. vim.fn.fnameescape(cwd))
+		local b = open_tree(top, "RtlTree")
+		local r = b and tree_rows(b)[2]
+		return r and r.hl.LazyVerilogRtlTreeFile
+	end
+	local span = file_span("cwd", dir)
+	if span ~= "[sub.sv]" then return "rtltree.path=cwd: expected [sub.sv], got " .. tostring(span) end
+	span = file_span("absolute", dir)
+	if not (span or ""):match("^%[/.*/sub%.sv%]$") then
+		return "rtltree.path=absolute: expected an absolute path, got " .. tostring(span)
+	end
+	span = file_span("tail", "/")
+	if span ~= "[sub.sv]" then return "rtltree.path=tail: expected [sub.sv], got " .. tostring(span) end
+	cfg.rtltree.path = nil
+	vim.cmd("cd " .. vim.fn.fnameescape(orig_cwd))
+
 	buf = open_tree(top, "RtlTree align")
 	if not buf then return "RtlTree align: no tree buffer" end
 	rows = tree_rows(buf)

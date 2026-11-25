@@ -56,8 +56,16 @@ M.defaults = {
 	-- override it for one tree.  `show_instance_name` / `show_file` are
 	-- deliberately absent: left nil, they come from `[rtltree]` in
 	-- lazyverilog.toml; set here, they override every project.
+	--
+	-- `path` sets how each node's `[file]` is shown (the server sends
+	-- absolute paths):
+	--   "cwd"      relative to :pwd, `~/…` outside it, else absolute
+	--   "project"  relative to the nearest lazyverilog.toml's directory
+	--   "tail"     file name only
+	--   "absolute" full path
 	rtltree = {
 		align = false,
+		path  = "cwd",
 	},
 
 	-- nvim-lspconfig / vim.lsp.start options forwarded verbatim.

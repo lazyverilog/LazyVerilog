@@ -39,6 +39,24 @@ require("lazyverilog").setup({ rtltree = { align = true } })  -- default: false
 
 `r` (refresh) keeps the layout the tree was opened with.
 
+### Neovim: file paths
+
+The server reports each file as an absolute path. `rtltree.path` sets how Neovim shows it:
+
+| Value | Shows |
+|-------|-------|
+| `"cwd"` (default) | Relative to Vim's `:pwd`; `~/…` for files outside it under your home; otherwise absolute |
+| `"project"` | Relative to the directory of the nearest `lazyverilog.toml` above the file; absolute if there is none |
+| `"tail"` | File name only |
+| `"absolute"` | Full path |
+
+```lua
+require("lazyverilog").setup({ rtltree = { path = "project" } })
+```
+
+Only the label changes: `<CR>` and the splits always open the real file. `lazyverilog-rtltree` (the CLI)
+still prints absolute paths.
+
 ### Neovim: highlight groups
 
 Each part of a row has its own highlight group. They are all linked with `default = true`, so your own

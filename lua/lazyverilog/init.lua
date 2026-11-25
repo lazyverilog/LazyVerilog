@@ -464,6 +464,52 @@ local function _rtltree_define_hl()
 	end
 end
 
+local _rtltree_path_modes = { cwd = true, project = true, tail = true, absolute = true }
+local _rtltree_warned_path_mode = false
+
+-- Resolve `setup({ rtltree = { path } })`; unknown values warn once, use "cwd".
+local function _rtltree_path_mode()
+	local mode = _cfg and _cfg.rtltree and _cfg.rtltree.path
+	if mode == nil then return "cwd" end
+	if _rtltree_path_modes[mode] then return mode end
+	if not _rtltree_warned_path_mode then
+		_rtltree_warned_path_mode = true
+		vim.notify("[LazyVerilog] rtltree.path must be \"cwd\", \"project\", \"tail\" or "
+			.. "\"absolute\"; got " .. vim.inspect(mode) .. ", using \"cwd\"", vim.log.levels.WARN)
+	end
+	return "cwd"
+end
+
+-- Display form of a node's file (the server sends absolute file:// URIs).
+-- `cache` memoizes the "project" root lookup per directory for one render.
+local function _rtltree_display_path(file, mode, cache)
+	local path = file
+	if path:match("^file://") then
+		path = vim.uri_to_fname(path)
+	end
+	if mode == "absolute" then
+		return path
+	elseif mode == "tail" then
+		return vim.fn.fnamemodify(path, ":t")
+	elseif mode == "project" then
+		local dir = vim.fs.dirname(path)
+		local root = cache[dir]
+		if root == nil then
+			root = vim.fs.root(path, "lazyverilog.toml") or false
+			cache[dir] = root
+		end
+		if root then
+			local norm_root = vim.fs.normalize(root)
+			local norm_path = vim.fs.normalize(path)
+			if norm_path:sub(1, #norm_root + 1) == norm_root .. "/" then
+				return norm_path:sub(#norm_root + 2)
+			end
+		end
+		return path
+	end
+	return vim.fn.fnamemodify(path, ":~:.")
+end
+
 -- Collect one tree node (recursive) as a row record of separate parts.
 -- Appends to `rows` and `line_data`; `_rtltree_layout` turns rows into text.
 local function _rtltree_render(node, rows, line_data, prefix, is_last, depth, opts)
@@ -472,7 +518,7 @@ local function _rtltree_render(node, rows, line_data, prefix, is_last, depth, op
 		row.inst = "(" .. node.inst .. ")"
 	end
 	if opts.show_file and node.file and node.file ~= "" then
-		row.file = "[" .. node.file:gsub("^file://", "") .. "]"
+		row.file = "[" .. _rtltree_display_path(node.file, opts.path_mode, opts.path_cache) .. "]"
 	end
 	if node.recursive then
 		row.marker = "<recursive>"
@@ -686,6 +732,9 @@ local function _rtltree_show(tree, source_buf)
 			opts.show_file = _cfg.rtltree.show_file
 		end
 	end
+
+	opts.path_mode  = _rtltree_path_mode()
+	opts.path_cache = {}
 
 	local align = _rtltree.align
 	if align == nil then
